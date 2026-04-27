@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback configuration for PlaywrightMcpServer.
+  IMPORTANT: MCP stdio transport uses STDOUT for JSON-RPC messages.
+  ALL logging MUST go to STDERR only — never to STDOUT.
+-->
+<configuration>
+
+    <!-- ── STDERR appender — safe for MCP stdio ─────────────────────────── -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- ── File appender — optional, useful for debugging ─────────────────── -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/playwright-mcp-server.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/playwright-mcp-server.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>100MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Suppress noisy Playwright internal logs -->
+    <logger name="com.microsoft.playwright" level="WARN"/>
+
+    <!-- MCP SDK transport — DEBUG only when troubleshooting -->
+    <logger name="io.modelcontextprotocol" level="INFO"/>
+
+    <!-- Our server -->
+    <logger name="com.qa.mcp" level="DEBUG"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDERR"/>
+        <appender-ref ref="FILE"/>
+    </root>
+
+</configuration>
