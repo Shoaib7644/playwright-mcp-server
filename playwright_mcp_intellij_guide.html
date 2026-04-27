@@ -1,0 +1,400 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans);color:var(--color-text-primary);background:transparent}
+.guide{max-width:720px;padding:8px 0 32px}
+.phase{margin-bottom:28px}
+.phase-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--color-border-tertiary)}
+.phase-badge{font-size:11px;font-weight:500;padding:3px 9px;border-radius:20px;letter-spacing:.4px}
+.badge-purple{background:#EEEDFE;color:#3C3489}.badge-teal{background:#E1F5EE;color:#085041}.badge-coral{background:#FAECE7;color:#993C1D}.badge-blue{background:#E6F1FB;color:#0C447C}.badge-amber{background:#FAEEDA;color:#633806}
+@media(prefers-color-scheme:dark){
+.badge-purple{background:#26215C;color:#CECBF6}.badge-teal{background:#04342C;color:#9FE1CB}.badge-coral{background:#4A1B0C;color:#F5C4B3}.badge-blue{background:#042C53;color:#B5D4F4}.badge-amber{background:#412402;color:#FAC775}
+}
+.phase-title{font-size:15px;font-weight:500}
+.steps{display:flex;flex-direction:column;gap:10px}
+.step{border:1px solid var(--color-border-tertiary);border-radius:10px;overflow:hidden;cursor:pointer;transition:border-color .15s}
+.step:hover{border-color:var(--color-border-secondary)}
+.step.open{border-color:var(--color-border-primary)}
+.step-head{display:flex;align-items:center;gap:10px;padding:11px 14px}
+.step-num{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex-shrink:0}
+.num-purple{background:#EEEDFE;color:#3C3489}.num-teal{background:#E1F5EE;color:#085041}.num-coral{background:#FAECE7;color:#993C1D}.num-blue{background:#E6F1FB;color:#0C447C}.num-amber{background:#FAEEDA;color:#633806}
+@media(prefers-color-scheme:dark){
+.num-purple{background:#26215C;color:#CECBF6}.num-teal{background:#04342C;color:#9FE1CB}.num-coral{background:#4A1B0C;color:#F5C4B3}.num-blue{background:#042C53;color:#B5D4F4}.num-amber{background:#412402;color:#FAC775}
+}
+.step-label{font-size:14px;font-weight:500;flex:1}
+.step-sub{font-size:12px;color:var(--color-text-secondary);margin-left:auto;margin-right:8px}
+.chevron{width:16px;height:16px;color:var(--color-text-tertiary);transition:transform .2s;flex-shrink:0}
+.step.open .chevron{transform:rotate(180deg)}
+.step-body{display:none;padding:0 14px 14px;border-top:1px solid var(--color-border-tertiary)}
+.step.open .step-body{display:block}
+.step-body p{font-size:13px;line-height:1.6;color:var(--color-text-secondary);margin-top:10px}
+.step-body p+p{margin-top:6px}
+.tip{background:var(--color-background-info);border-left:3px solid var(--color-border-info);border-radius:0 6px 6px 0;padding:8px 12px;margin-top:10px;font-size:12px;color:var(--color-text-info);line-height:1.5}
+.warn{background:var(--color-background-warning);border-left:3px solid var(--color-border-warning);border-radius:0 6px 6px 0;padding:8px 12px;margin-top:10px;font-size:12px;color:var(--color-text-warning);line-height:1.5}
+code{font-family:var(--font-mono);font-size:12px;background:var(--color-background-secondary);padding:1px 5px;border-radius:4px}
+pre{font-family:var(--font-mono);font-size:12px;background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:8px;padding:12px;margin-top:10px;overflow-x:auto;line-height:1.6;white-space:pre}
+.img-placeholder{background:var(--color-background-secondary);border:1px dashed var(--color-border-secondary);border-radius:8px;padding:14px;margin-top:10px;font-size:12px;color:var(--color-text-tertiary);text-align:center}
+ul{margin-top:8px;padding-left:18px;font-size:13px;color:var(--color-text-secondary);line-height:1.7}
+strong{font-weight:500;color:var(--color-text-primary)}
+</style>
+<div class="guide">
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-badge badge-purple">Phase 1</span>
+    <span class="phase-title">Set up your Mac + IntelliJ IDEA</span>
+  </div>
+  <div class="steps">
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-purple">1</div>
+        <div class="step-label">Install prerequisites</div>
+        <span class="step-sub">JDK 17 + Maven + Git</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>Open <strong>Terminal</strong> and install via Homebrew (recommended on macOS):</p>
+        <pre>brew install openjdk@17 maven git
+echo 'export JAVA_HOME=/opt/homebrew/opt/openjdk@17' >> ~/.zshrc
+echo 'export PATH="$JAVA_HOME/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc</pre>
+        <p>Verify everything works:</p>
+        <pre>java -version   # should say: openjdk 17...
+mvn -version    # should say: Apache Maven 3.x
+git --version</pre>
+        <div class="tip">On Apple Silicon Macs, Homebrew installs to <code>/opt/homebrew</code> — not <code>/usr/local</code>. The export above handles this automatically.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-purple">2</div>
+        <div class="step-label">Download IntelliJ IDEA</div>
+        <span class="step-sub">Community (free) or Ultimate</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>Download from <strong>jetbrains.com/idea</strong>. The free <strong>Community Edition</strong> is sufficient — it handles Maven, Java, and run configurations fully.</p>
+        <p>During install, when IDEA asks about the JDK, point it at <code>/opt/homebrew/opt/openjdk@17</code> using <strong>Add JDK → Detect</strong> or by pasting the path manually.</p>
+        <div class="tip">In IDEA: <strong>Settings → Build → Build Tools → Maven</strong> — set Maven home to the output of <code>mvn -version</code> (usually <code>/opt/homebrew/opt/maven</code>). This ensures IDEA uses the same Maven as your terminal.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-badge badge-teal">Phase 2</span>
+    <span class="phase-title">Create the Maven project in IntelliJ</span>
+  </div>
+  <div class="steps">
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-teal">3</div>
+        <div class="step-label">Create new project</div>
+        <span class="step-sub">Maven archetype</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <ul>
+          <li>Click <strong>File → New → Project</strong></li>
+          <li>In the left panel select <strong>New Project</strong></li>
+          <li>Set <strong>Language</strong> to <code>Java</code></li>
+          <li>Set <strong>Build system</strong> to <code>Maven</code></li>
+          <li>Set <strong>JDK</strong> to <code>17</code></li>
+          <li>Set <strong>Group ID</strong> to <code>com.qa.mcp</code></li>
+          <li>Set <strong>Artifact ID</strong> to <code>playwright-mcp-server</code></li>
+          <li>Set <strong>Version</strong> to <code>1.0.0-SNAPSHOT</code></li>
+          <li>Name the project folder <code>playwright-mcp-server</code></li>
+          <li>Click <strong>Create</strong></li>
+        </ul>
+        <div class="tip">Do NOT check "Add sample code". You will paste the provided files manually into the right locations.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-teal">4</div>
+        <div class="step-label">Build the correct folder structure</div>
+        <span class="step-sub">Standard Maven layout</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>In the <strong>Project</strong> panel on the left, your final structure should look exactly like this:</p>
+        <pre>playwright-mcp-server/
+├── pom.xml
+└── src/
+    └── main/
+        ├── java/
+        │   └── com/
+        │       └── qa/
+        │           └── mcp/
+        │               ├── PlaywrightMcpServer.java
+        │               └── BddCodeGenerator.java
+        └── resources/
+            └── logback.xml</pre>
+        <p>To create missing folders: right-click <code>src/main/java</code> → <strong>New → Package</strong> → type <code>com.qa.mcp</code>. IDEA creates all the nested folders in one step.</p>
+        <p>For <code>resources</code>: right-click <code>src/main</code> → <strong>New → Directory</strong> → select <code>resources</code> from the suggested list (IDEA will auto-mark it as a Resources Root).</p>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-teal">5</div>
+        <div class="step-label">Paste the source files</div>
+        <span class="step-sub">3 files to create</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <ul>
+          <li>Right-click <code>com.qa.mcp</code> package → <strong>New → Java Class</strong> → name it <code>PlaywrightMcpServer</code>. Paste the full contents of that file.</li>
+          <li>Repeat for <code>BddCodeGenerator</code>.</li>
+          <li>Right-click the <code>resources</code> folder → <strong>New → File</strong> → name it <code>logback.xml</code>. Paste the logback config contents.</li>
+          <li>Finally, open the <code>pom.xml</code> that IDEA created at the project root and <strong>replace its entire contents</strong> with the provided <code>pom.xml</code>.</li>
+        </ul>
+        <div class="warn">After pasting pom.xml, a blue banner will appear at the top of the editor saying "Maven build scripts found". Click <strong>Load Maven Project</strong> — IDEA will now download all dependencies automatically.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-badge badge-coral">Phase 3</span>
+    <span class="phase-title">Install Playwright browsers + first build</span>
+  </div>
+  <div class="steps">
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-coral">6</div>
+        <div class="step-label">Download Chromium (one-time)</div>
+        <span class="step-sub">Required before running</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>Open the <strong>Terminal</strong> tab at the bottom of IDEA (or use your Mac Terminal, cd into the project folder) and run:</p>
+        <pre>mvn exec:java@install-browsers</pre>
+        <p>This runs the Playwright CLI and downloads Chromium (~170 MB) to your home folder at <code>~/.cache/ms-playwright</code>. It only needs to run once per machine.</p>
+        <div class="tip">If the download stalls, add <code>-Dexec.args="install chromium --with-deps"</code> to also install the system dependencies Playwright needs on some macOS configurations.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-coral">7</div>
+        <div class="step-label">Build the fat jar</div>
+        <span class="step-sub">Creates the deployable artifact</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>Either in the IDEA Terminal or via the Maven panel (right sidebar → <strong>Lifecycle → package</strong>), run:</p>
+        <pre>mvn clean package -DskipTests</pre>
+        <p>This produces:</p>
+        <pre>target/playwright-mcp-server-1.0.0-SNAPSHOT.jar   ← the fat jar (~60 MB)</pre>
+        <p>Verify it works by doing a quick smoke-test in terminal:</p>
+        <pre>java -jar target/playwright-mcp-server-1.0.0-SNAPSHOT.jar</pre>
+        <p>You should see <code>PlaywrightMcpServer running on stdio…</code> in stderr. It will wait for JSON-RPC input — press <strong>Ctrl+C</strong> to exit.</p>
+        <div class="tip">In IDEA you can also create a Run Configuration: <strong>Run → Edit Configurations → + → Application</strong>, set Main class to <code>com.qa.mcp.PlaywrightMcpServer</code>. Use this for debugging with breakpoints.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-coral">8</div>
+        <div class="step-label">Set up a Run Configuration for debugging</div>
+        <span class="step-sub">Optional but highly recommended</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <ul>
+          <li>Go to <strong>Run → Edit Configurations → click +</strong></li>
+          <li>Choose <strong>Application</strong></li>
+          <li>Name: <code>MCP Server (debug)</code></li>
+          <li>Module: <code>playwright-mcp-server</code></li>
+          <li>Main class: <code>com.qa.mcp.PlaywrightMcpServer</code></li>
+          <li>Working directory: <code>$MODULE_WORKING_DIR$</code></li>
+          <li>Click <strong>OK</strong></li>
+        </ul>
+        <p>Now you can set breakpoints in <code>handleStartRecording</code>, <code>handleGenerateBdd</code>, etc. and use the IDEA debugger to step through the MCP tool logic live.</p>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-badge badge-blue">Phase 4</span>
+    <span class="phase-title">Integrate with GitHub Copilot agent (MCP)</span>
+  </div>
+  <div class="steps">
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-blue">9</div>
+        <div class="step-label">Integrate with IntelliJ IDEA + Copilot</div>
+        <span class="step-sub">Via .github/copilot-mcp.json</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>GitHub Copilot's agent mode reads MCP server configs from a <code>.github/copilot-mcp.json</code> file in your project root (or from VS Code / IDEA global settings).</p>
+        <p>Create the file <code>.github/copilot-mcp.json</code> inside your project (or any project you want to use the server from):</p>
+        <pre>{
+  "servers": {
+    "playwright-mcp": {
+      "type": "stdio",
+      "command": "java",
+      "args": [
+        "-jar",
+        "/Users/YOUR_USERNAME/projects/playwright-mcp-server/target/playwright-mcp-server-1.0.0-SNAPSHOT.jar"
+      ]
+    }
+  }
+}</pre>
+        <p>Replace <code>/Users/YOUR_USERNAME/projects/...</code> with the actual absolute path to your jar. You can get it by running <code>pwd</code> inside the project folder in Terminal.</p>
+        <div class="tip">In IDEA: open the <strong>GitHub Copilot</strong> chat panel → click the <strong>agent icon (✦)</strong> → your tool names (<code>start_recording</code>, <code>stop_recording</code>, etc.) should appear in the tool list. If not, click <strong>Refresh MCP servers</strong>.</div>
+        <div class="warn">Use <strong>absolute paths only</strong> — never relative paths like <code>./target/...</code>. The MCP host process runs from a different working directory and relative paths will fail silently.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-blue">10</div>
+        <div class="step-label">Integrate with Eclipse + Copilot</div>
+        <span class="step-sub">Via VS Code-style settings.json</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>GitHub Copilot in Eclipse uses the same MCP config as VS Code. Edit the global Copilot settings file at:</p>
+        <pre>~/.config/github-copilot/settings.json   (macOS/Linux)</pre>
+        <p>Add the following block (merge with existing content if the file already exists):</p>
+        <pre>{
+  "github.copilot.advanced": {},
+  "mcp": {
+    "servers": {
+      "playwright-mcp": {
+        "type": "stdio",
+        "command": "java",
+        "args": [
+          "-jar",
+          "/Users/YOUR_USERNAME/projects/playwright-mcp-server/target/playwright-mcp-server-1.0.0-SNAPSHOT.jar"
+        ]
+      }
+    }
+  }
+}</pre>
+        <p>Restart Eclipse. In the Copilot Chat panel, switch to <strong>Agent mode</strong>. Your Playwright tools will be available.</p>
+        <div class="tip">Eclipse's Copilot plugin version must be <strong>1.5.0+</strong> for MCP agent support. Check via <strong>Help → About → Installation Details</strong> and search "Copilot".</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-blue">11</div>
+        <div class="step-label">Test the integration end-to-end</div>
+        <span class="step-sub">First live recording</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>In the Copilot agent chat panel (IDEA or Eclipse), type:</p>
+        <pre>Use start_recording with url "https://example.com"</pre>
+        <p>A Chromium window will open. Interact with the page (click links, fill forms). Then type:</p>
+        <pre>Use stop_recording</pre>
+        <p>You will get back a JSON array of every captured interaction. Then to generate the full BDD project:</p>
+        <pre>Use generate_playwright_bdd with the recording above and featureName "My First Test"</pre>
+        <p>The agent will return the Feature file, Step Definitions, Page Object, and pom.xml all inline in the chat.</p>
+        <div class="tip">Copy each generated file into the correct folder of a new Maven project. Run <code>mvn test</code> to execute the BDD scenario against a live browser.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-badge badge-amber">Phase 5</span>
+    <span class="phase-title">Build, publish and share the server</span>
+  </div>
+  <div class="steps">
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-amber">12</div>
+        <div class="step-label">Version and tag a release</div>
+        <span class="step-sub">Git + Maven versions plugin</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>When ready to share a stable version, bump the version and tag it:</p>
+        <pre>mvn versions:set -DnewVersion=1.0.0
+git add pom.xml
+git commit -m "chore: release v1.0.0"
+git tag v1.0.0
+git push origin main --tags</pre>
+        <div class="tip">Use <code>mvn versions:revert</code> if you set the wrong version — it restores the backup pom.xml that the plugin automatically creates.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-amber">13</div>
+        <div class="step-label">Publish to GitHub Packages</div>
+        <span class="step-sub">Share within your org</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>Add this to your <code>pom.xml</code> inside the <code>&lt;project&gt;</code> block:</p>
+        <pre>&lt;distributionManagement&gt;
+  &lt;repository&gt;
+    &lt;id&gt;github&lt;/id&gt;
+    &lt;url&gt;https://maven.pkg.github.com/YOUR_ORG/playwright-mcp-server&lt;/url&gt;
+  &lt;/repository&gt;
+&lt;/distributionManagement&gt;</pre>
+        <p>Add a token to <code>~/.m2/settings.xml</code>:</p>
+        <pre>&lt;servers&gt;
+  &lt;server&gt;
+    &lt;id&gt;github&lt;/id&gt;
+    &lt;username&gt;YOUR_GITHUB_USERNAME&lt;/username&gt;
+    &lt;password&gt;ghp_YOUR_PAT_TOKEN&lt;/password&gt;
+  &lt;/server&gt;
+&lt;/servers&gt;</pre>
+        <p>Then deploy:</p>
+        <pre>mvn clean deploy -DskipTests</pre>
+        <div class="tip">The PAT token needs <code>write:packages</code> scope. Create it at <strong>github.com → Settings → Developer settings → Personal access tokens</strong>.</div>
+      </div>
+    </div>
+
+    <div class="step" onclick="toggle(this)">
+      <div class="step-head">
+        <div class="step-num num-amber">14</div>
+        <div class="step-label">Share the fat jar directly (simpler)</div>
+        <span class="step-sub">No registry needed</span>
+        <svg class="chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="step-body">
+        <p>For team distribution, the fat jar is self-contained — teammates only need Java 17 installed. Upload <code>target/playwright-mcp-server-1.0.0-SNAPSHOT.jar</code> to:</p>
+        <ul>
+          <li>A <strong>GitHub Release</strong> asset (attach via the Releases UI)</li>
+          <li>Your team's <strong>shared network drive</strong></li>
+          <li>An <strong>S3 bucket</strong> with a download link</li>
+        </ul>
+        <p>Teammates then just update the <code>args</code> path in their <code>copilot-mcp.json</code> to point to wherever they placed the jar locally.</p>
+        <div class="tip">Document that teammates must also run the one-time browser install: <code>java -cp playwright-mcp-server-1.0.0.jar com.microsoft.playwright.CLI install chromium</code></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div>
+<script>
+function toggle(el){
+  const wasOpen = el.classList.contains('open');
+  el.classList.toggle('open', !wasOpen);
+}
+</script>
