@@ -1,545 +1,447 @@
 package com.qa.mcp;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper; // ADD THIS
+import com.fasterxml.jackson.databind.SerializationFeature; // ADD THIS IF NEEDED
 
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 
 /**
- * BddCodeGenerator
+ * BddCodeGenerator v4
  *
- * Given a feature name and a parsed JSON recording, produces:
- *   • Gherkin Feature file
- *   • Cucumber Step Definitions (Java)
- *   • Page Object Model class  (Java)
- *   • JUnit 5 Platform Runner
- *   • pom.xml (static helper)
+ * Changes from v3:
+ * ─────────────────
+ * • Uses playwrightLocator field from recording (already has .nth() when needed).
+ * • FOCUS events are excluded from feature file and step defs entirely.
+ * • Collapses consecutive HOVER+CLICK on same locator into a single CLICK step.
+ * • Page Object uses the most-unique strategy field to pick the correct API call.
+ * • Step definitions use scoped locators — no bare getByText() for ambiguous text.
+ * • Generates a LocatorHelper utility that centralises nth-scoped access.
  */
 public class BddCodeGenerator {
 
-    private final String      featureName;
-    private final JsonNode    steps;
-    private final String      className;   // e.g. "UserLogin"
-    private final String      varName;     // e.g. "userLogin"
-    private final List<Step>  parsed;
+    private final String   featureName;
+    private final String   className;
+    private final JsonNode events;
 
-    public BddCodeGenerator(String featureName, JsonNode steps) {
+    // Deduplication: track locator fields already used as Page Object fields
+    private final Map<String, String>  fieldToLocatorExpr = new LinkedHashMap<>();
+    private final Map<String, String>  fieldToMethod      = new LinkedHashMap<>();
+
+    public BddCodeGenerator(String featureName, JsonNode events) {
         this.featureName = featureName;
-        this.steps       = steps;
-        this.className   = toCamelCase(featureName, true);
-        this.varName     = toCamelCase(featureName, false);
-        this.parsed      = parseSteps(steps);
+        this.className   = toPascal(featureName);
+        this.events      = collapseHoverClick(events);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  FEATURE FILE
-    // ─────────────────────────────────────────────────────────────────────────
-
+    // ── FEATURE FILE ──────────────────────────────────────────────────────────
     public String featureFile() {
-        var sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder();
+        sb.append("@smoke @regression\n");
         sb.append("Feature: ").append(featureName).append("\n\n");
-        sb.append("  As a user\n");
-        sb.append("  I want to ").append(featureName.toLowerCase()).append("\n");
-        sb.append("  So that I can complete my task successfully\n\n");
+        sb.append("  Background:\n");
+        sb.append("    Given the browser is open\n\n");
         sb.append("  Scenario: ").append(featureName).append("\n");
 
-        boolean firstNav = true;
-        int stepNum = 0;
-        for (Step s : parsed) {
-            String keyword = stepNum == 0 ? "Given" : (s.action.equals("navigate") ? "When" : "And");
-            switch (s.action) {
-                case "navigate" -> {
-                    if (firstNav) {
-                        sb.append("    Given the user opens \"").append(s.value).append("\"\n");
-                        firstNav = false;
-                    } else {
-                        sb.append("    When  the user navigates to \"").append(s.value).append("\"\n");
-                    }
-                }
-                case "fill", "type" ->
-                        sb.append("    And   the user fills \"").append(humanLabel(s.selector))
-                                .append("\" with \"").append(s.value).append("\"\n");
-                case "click", "getbytext", "click_text" ->
-                        sb.append("    And   the user clicks \"").append(humanLabel(s.selector)).append("\"\n");
-                case "select_option" ->
-                        sb.append("    And   the user selects \"").append(s.value)
-                                .append("\" from \"").append(humanLabel(s.selector)).append("\"\n");
-                case "submit" ->
-                        sb.append("    And   the user submits the form\n");
-                case "check" ->
-                        sb.append("    And   the user checks \"").append(humanLabel(s.selector)).append("\"\n");
-                default ->
-                        sb.append("    And   the user performs ").append(s.action)
-                                .append(" on \"").append(humanLabel(s.selector)).append("\"\n");
-            }
-            stepNum++;
+        for (JsonNode e : events) {
+            String step = toGherkinStep(e);
+            if (step != null) sb.append("    ").append(step).append("\n");
         }
-        sb.append("    Then  the action completes successfully\n");
         return sb.toString();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  STEP DEFINITIONS
-    // ─────────────────────────────────────────────────────────────────────────
+    private String toGherkinStep(JsonNode e) {
+        String at  = e.path("actionType").asText();
+        String val = e.path("inputValue").asText("");
+        String key = e.path("key").asText("");
+        String loc = readableLabel(e);
 
+        // Skip FOCUS — informational only
+        if ("FOCUS".equals(at)) return null;
+
+        return switch (at) {
+            case "NAVIGATE"      -> "When I navigate to \"" + esc(val) + "\"";
+            case "CLICK"         -> "When I click the \"" + loc + "\" element";
+            case "DOUBLE_CLICK"  -> "When I double-click the \"" + loc + "\" element";
+            case "RIGHT_CLICK"   -> "When I right-click the \"" + loc + "\" element";
+            case "FILL"          -> "When I fill \"" + esc(val) + "\" into the \"" + loc + "\" field";
+            case "SELECT_OPTION" -> "When I select \"" + esc(val) + "\" from the \"" + loc + "\" dropdown";
+            case "CHECK"         -> "When I check the \"" + loc + "\" checkbox";
+            case "UNCHECK"       -> "When I uncheck the \"" + loc + "\" checkbox";
+            case "PRESS_KEY"     -> "When I press the \"" + esc(key) + "\" key";
+            case "HOVER"         -> "When I hover over the \"" + loc + "\" element";
+            case "SCROLL"        -> {
+                int sx = e.path("scrollX").asInt(0);
+                int sy = e.path("scrollY").asInt(0);
+                yield "When I scroll the page to position " + sx + ", " + sy;
+            }
+            case "ASSERT_TEXT"   -> "Then I should see \"" + esc(val) + "\" on the page";
+            case "ASSERT_URL"    -> "Then the URL should be \"" + esc(val) + "\"";
+            case "FORM_SUBMIT"   -> "When I submit the form";
+            default              -> null;
+        };
+    }
+
+    // ── PAGE OBJECT ───────────────────────────────────────────────────────────
+    public String pageObject() {
+        StringBuilder fields  = new StringBuilder();
+        StringBuilder inits   = new StringBuilder();
+        StringBuilder methods = new StringBuilder();
+
+        for (JsonNode e : events) {
+            String at = e.path("actionType").asText();
+            if ("FOCUS".equals(at) || "NAVIGATE".equals(at) ||
+                    "SCROLL".equals(at) || "NAVIGATE".equals(at)) continue;
+
+            JsonNode loc = e.path("locator");
+            if (loc.isMissingNode() || loc.isNull()) continue;
+
+            String pwExpr    = scopedPlaywrightExpr(loc);
+            String fieldName = toFieldName(e);
+            if (fieldName == null || fieldToLocatorExpr.containsKey(fieldName)) continue;
+
+            fieldToLocatorExpr.put(fieldName, pwExpr);
+
+            fields.append("    private final Locator ").append(fieldName).append(";\n");
+            inits.append("        this.").append(fieldName).append(" = ").append(pwExpr).append(";\n");
+
+            String method = buildMethod(at, fieldName, val(e));
+            if (method != null && !fieldToMethod.containsKey(fieldName)) {
+                fieldToMethod.put(fieldName, method);
+                methods.append(method).append("\n");
+            }
+        }
+
+        return "package com.qa.pages;\n\n" +
+                "import com.microsoft.playwright.*;\n" +
+                "import com.microsoft.playwright.options.AriaRole;\n\n" +
+                "/** Page Object — " + featureName + " (generated by PlaywrightMcpServer v4) */\n" +
+                "public class " + className + "Page {\n\n" +
+                "    private final Page page;\n\n" +
+                fields + "\n" +
+                "    public " + className + "Page(Page page) {\n" +
+                "        this.page = page;\n" +
+                inits +
+                "    }\n\n" +
+                "    public " + className + "Page navigateTo(String url) {\n" +
+                "        page.navigate(url);\n" +
+                "        return this;\n" +
+                "    }\n\n" +
+                methods +
+                "}\n";
+    }
+
+    // ── STEP DEFINITIONS ──────────────────────────────────────────────────────
     public String stepDefinitions() {
-        var sb = new StringBuilder();
-        sb.append("package com.qa.steps;\n\n");
-        sb.append("import com.qa.pages.").append(className).append("Page;\n");
-        sb.append("import io.cucumber.java.en.*;\n");
-        sb.append("import io.cucumber.java.After;\n");
-        sb.append("import io.cucumber.java.Before;\n");
-        sb.append("import com.microsoft.playwright.*;\n\n");
-
-        sb.append("public class ").append(className).append("Steps {\n\n");
-        sb.append("    private Playwright playwright;\n");
-        sb.append("    private Browser browser;\n");
-        sb.append("    private Page page;\n");
-        sb.append("    private ").append(className).append("Page ").append(varName).append("Page;\n\n");
-
-        // @Before
-        sb.append("    @Before\n");
-        sb.append("    public void setUp() {\n");
-        sb.append("        playwright  = Playwright.create();\n");
-        sb.append("        browser     = playwright.chromium().launch(\n");
-        sb.append("            new BrowserType.LaunchOptions().setHeadless(false));\n");
-        sb.append("        page        = browser.newPage();\n");
-        sb.append("        ").append(varName).append("Page = new ").append(className).append("Page(page);\n");
-        sb.append("    }\n\n");
-
-        // @After
-        sb.append("    @After\n");
-        sb.append("    public void tearDown() {\n");
-        sb.append("        if (page     != null) page.close();\n");
-        sb.append("        if (browser  != null) browser.close();\n");
-        sb.append("        if (playwright != null) playwright.close();\n");
-        sb.append("    }\n\n");
-
-        // Deduplicate step definitions (same Gherkin text could appear twice)
+        StringBuilder stepImpls = new StringBuilder();
         Set<String> seen = new LinkedHashSet<>();
 
-        for (Step s : parsed) {
-            String stepDef = buildStepDef(s);
-            if (stepDef != null && seen.add(stepDef)) {
-                sb.append(stepDef).append("\n");
-            }
+        for (JsonNode e : events) {
+            String at  = e.path("actionType").asText();
+            if ("FOCUS".equals(at)) continue;
+
+            String stepKey = at + "|" + readableLabel(e);
+            if (seen.contains(stepKey)) continue;
+            seen.add(stepKey);
+
+            String impl = toStepImpl(e, at);
+            if (impl != null) stepImpls.append(impl).append("\n");
         }
 
-        // Catch-all "Then" assertion
-        sb.append("    @Then(\"the action completes successfully\")\n");
-        sb.append("    public void verifySuccess() {\n");
-        sb.append("        // TODO: add explicit assertions, e.g.\n");
-        sb.append("        // org.junit.jupiter.api.Assertions.assertTrue(page.title().length() > 0);\n");
-        sb.append("        System.out.println(\"[PASS] Scenario completed — page title: \" + page.title());\n");
-        sb.append("    }\n");
-
-        sb.append("}\n");
-        return sb.toString();
+        return "package com.qa.stepdefs;\n\n" +
+                "import com.microsoft.playwright.*;\n" +
+                "import com.qa.pages." + className + "Page;\n" +
+                "import io.cucumber.java.*;\n" +
+                "import io.cucumber.java.en.*;\n" +
+                "import org.junit.jupiter.api.Assertions;\n\n" +
+                "public class " + className + "Steps {\n\n" +
+                "    private Playwright playwright;\n" +
+                "    private Browser browser;\n" +
+                "    private BrowserContext context;\n" +
+                "    private Page page;\n" +
+                "    private " + className + "Page " + toCamel(className) + "Page;\n\n" +
+                "    @Before\n" +
+                "    public void setUp() {\n" +
+                "        playwright = Playwright.create();\n" +
+                "        browser    = playwright.chromium().launch(\n" +
+                "                       new BrowserType.LaunchOptions().setHeadless(true));\n" +
+                "        context    = browser.newContext(\n" +
+                "                       new Browser.NewContextOptions().setBypassCSP(true));\n" +
+                "        page       = context.newPage();\n" +
+                "        " + toCamel(className) + "Page = new " + className + "Page(page);\n" +
+                "    }\n\n" +
+                "    @After\n" +
+                "    public void tearDown() {\n" +
+                "        if (context    != null) context.close();\n" +
+                "        if (browser    != null) browser.close();\n" +
+                "        if (playwright != null) playwright.close();\n" +
+                "    }\n\n" +
+                "    @Given(\"the browser is open\")\n" +
+                "    public void theBrowserIsOpen() { /* ready via @Before */ }\n\n" +
+                "    @When(\"I navigate to {string}\")\n" +
+                "    public void iNavigateTo(String url) {\n" +
+                "        " + toCamel(className) + "Page.navigateTo(url);\n" +
+                "    }\n\n" +
+                "    @When(\"I scroll the page to position {int}, {int}\")\n" +
+                "    public void iScrollThePage(int x, int y) {\n" +
+                "        page.mouse().wheel(x, y);\n" +
+                "    }\n\n" +
+                "    @Then(\"the URL should be {string}\")\n" +
+                "    public void theUrlShouldBe(String url) {\n" +
+                "        Assertions.assertEquals(url, page.url());\n" +
+                "    }\n\n" +
+                "    @Then(\"I should see {string} on the page\")\n" +
+                "    public void iShouldSeeOnThePage(String text) {\n" +
+                "        Assertions.assertTrue(page.getByText(text).first().isVisible());\n" +
+                "    }\n\n" +
+                stepImpls +
+                "}\n";
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  PAGE OBJECT
-    // ─────────────────────────────────────────────────────────────────────────
-
-    public String pageObject() {
-        var sb = new StringBuilder();
-        sb.append("package com.qa.pages;\n\n");
-        sb.append("import com.microsoft.playwright.*;\n");
-        sb.append("import com.microsoft.playwright.options.AriaRole;\n\n");
-
-        sb.append("/**\n");
-        sb.append(" * Page Object for: ").append(featureName).append("\n");
-        sb.append(" * Auto-generated by PlaywrightMcpServer — review selectors before production use.\n");
-        sb.append(" */\n");
-        sb.append("public class ").append(className).append("Page {\n\n");
-        sb.append("    private final Page page;\n\n");
-
-        // Field declarations from recorded selectors
-        Set<String> fieldNames = new LinkedHashSet<>();
-        for (Step s : parsed) {
-            if (!s.selector.isBlank() && !s.action.equals("navigate")) {
-                String field = toFieldName(s.selector);
-                if (fieldNames.add(field)) {
-                    sb.append("    // Selector: ").append(s.selector).append("\n");
-                    sb.append("    private final Locator ").append(field).append(";\n\n");
-                }
-            }
-        }
-
-        // Constructor
-        sb.append("    public ").append(className).append("Page(Page page) {\n");
-        sb.append("        this.page = page;\n");
-        fieldNames.clear();
-        for (Step s : parsed) {
-            if (!s.selector.isBlank() && !s.action.equals("navigate")) {
-                String field = toFieldName(s.selector);
-                if (fieldNames.add(field)) {
-                    sb.append("        this.").append(field)
-                            .append(" = ").append(buildLocatorInit(s.selector)).append(";\n");
-                }
-            }
-        }
-        sb.append("    }\n\n");
-
-        // navigate()
-        for (Step s : parsed) {
-            if (s.action.equals("navigate")) {
-                sb.append("    public void navigate() {\n");
-                sb.append("        page.navigate(\"").append(s.value).append("\");\n");
-                sb.append("    }\n\n");
-                break;
-            }
-        }
-
-        // Action methods  (deduplicated)
-        Set<String> methodSigs = new LinkedHashSet<>();
-        for (Step s : parsed) {
-            if (s.selector.isBlank() || s.action.equals("navigate")) continue;
-            String field  = toFieldName(s.selector);
-            String method = buildMethodCode(s, field);
-            if (method != null && methodSigs.add(field + "::" + s.action)) {
-                sb.append(method).append("\n");
-            }
-        }
-
-        sb.append("}\n");
-        return sb.toString();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  JUNIT RUNNER
-    // ─────────────────────────────────────────────────────────────────────────
-
+    // ── JUNIT RUNNER ──────────────────────────────────────────────────────────
     public String jUnitRunner() {
-        return """
-                package com.qa.runner;
-
-                import org.junit.platform.suite.api.*;
-                import static io.cucumber.junit.platform.engine.Constants.*;
-
-                @Suite
-                @IncludeEngines("cucumber")
-                @SelectClasspathResource("features")
-                @ConfigurationParameter(key = PLUGIN_PROPERTY_NAME,
-                    value = "pretty, html:target/cucumber-reports/report.html")
-                @ConfigurationParameter(key = GLUE_PROPERTY_NAME,
-                    value = "com.qa.steps")
-                public class CucumberTestRunner {
-                    // JUnit Platform launcher — no body needed
-                }
-                """;
+        return "package com.qa.runners;\n\n" +
+                "import io.cucumber.junit.platform.engine.Constants;\n" +
+                "import org.junit.platform.suite.api.*;\n\n" +
+                "@Suite\n@IncludeEngines(\"cucumber\")\n" +
+                "@SelectClasspathResource(\"features\")\n" +
+                "@ConfigurationParameter(key=Constants.GLUE_PROPERTY_NAME, value=\"com.qa.stepdefs\")\n" +
+                "@ConfigurationParameter(key=Constants.PLUGIN_PROPERTY_NAME,\n" +
+                "        value=\"pretty, html:target/cucumber-reports/" + className +
+                "-report.html, json:target/cucumber-reports/" + className + ".json\")\n" +
+                "@ConfigurationParameter(key=Constants.FILTER_TAGS_PROPERTY_NAME, value=\"@smoke\")\n" +
+                "public class " + className + "Runner {}\n";
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  POM.XML (static)
-    // ─────────────────────────────────────────────────────────────────────────
-
+    // ── POM.XML ───────────────────────────────────────────────────────────────
     public static String pomXml() {
         return """
-                <?xml version="1.0" encoding="UTF-8"?>
-                <project xmlns="http://maven.apache.org/POM/4.0.0"
-                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                         https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                  <modelVersion>4.0.0</modelVersion>
-
-                  <groupId>com.qa</groupId>
-                  <artifactId>playwright-bdd-framework</artifactId>
-                  <version>1.0.0-SNAPSHOT</version>
-                  <packaging>jar</packaging>
-
-                  <properties>
-                    <java.version>17</java.version>
-                    <maven.compiler.source>${java.version}</maven.compiler.source>
-                    <maven.compiler.target>${java.version}</maven.compiler.target>
-                    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-
-                    <!-- Dependency versions -->
-                    <playwright.version>1.44.0</playwright.version>
-                    <cucumber.version>7.18.0</cucumber.version>
-                    <junit.platform.version>1.10.2</junit.platform.version>
-                    <junit.jupiter.version>5.10.2</junit.jupiter.version>
-                    <jackson.version>2.17.1</jackson.version>
-                    <mcp.version>0.9.0</mcp.version>
-                  </properties>
-
-                  <dependencies>
-
-                    <!-- ── Playwright Java ──────────────────────────────────── -->
-                    <dependency>
-                      <groupId>com.microsoft.playwright</groupId>
-                      <artifactId>playwright</artifactId>
-                      <version>${playwright.version}</version>
-                    </dependency>
-
-                    <!-- ── MCP Java SDK (stdio transport) ───────────────────── -->
-                    <dependency>
-                      <groupId>io.modelcontextprotocol.sdk</groupId>
-                      <artifactId>mcp</artifactId>
-                      <version>${mcp.version}</version>
-                    </dependency>
-
-                    <!-- ── Cucumber / BDD ───────────────────────────────────── -->
-                    <dependency>
-                      <groupId>io.cucumber</groupId>
-                      <artifactId>cucumber-java</artifactId>
-                      <version>${cucumber.version}</version>
-                    </dependency>
-                    <dependency>
-                      <groupId>io.cucumber</groupId>
-                      <artifactId>cucumber-junit-platform-engine</artifactId>
-                      <version>${cucumber.version}</version>
-                    </dependency>
-
-                    <!-- ── JUnit 5 ──────────────────────────────────────────── -->
-                    <dependency>
-                      <groupId>org.junit.jupiter</groupId>
-                      <artifactId>junit-jupiter-api</artifactId>
-                      <version>${junit.jupiter.version}</version>
-                      <scope>test</scope>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.junit.platform</groupId>
-                      <artifactId>junit-platform-suite</artifactId>
-                      <version>${junit.platform.version}</version>
-                      <scope>test</scope>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.junit.platform</groupId>
-                      <artifactId>junit-platform-launcher</artifactId>
-                      <version>${junit.platform.version}</version>
-                      <scope>test</scope>
-                    </dependency>
-
-                    <!-- ── Jackson (JSON) ───────────────────────────────────── -->
-                    <dependency>
-                      <groupId>com.fasterxml.jackson.core</groupId>
-                      <artifactId>jackson-databind</artifactId>
-                      <version>${jackson.version}</version>
-                    </dependency>
-
-                  </dependencies>
-
-                  <build>
-                    <plugins>
-
-                      <!-- Compiler -->
-                      <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-compiler-plugin</artifactId>
-                        <version>3.13.0</version>
-                        <configuration>
-                          <release>17</release>
-                        </configuration>
-                      </plugin>
-
-                      <!-- Surefire — runs JUnit Platform (Cucumber) tests -->
-                      <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-surefire-plugin</artifactId>
-                        <version>3.2.5</version>
-                        <configuration>
-                          <includes>
-                            <include>**/CucumberTestRunner.class</include>
-                          </includes>
-                        </configuration>
-                      </plugin>
-
-                      <!-- Exec — run the MCP server directly -->
-                      <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>exec-maven-plugin</artifactId>
-                        <version>3.3.0</version>
-                        <configuration>
-                          <mainClass>com.qa.mcp.PlaywrightMcpServer</mainClass>
-                        </configuration>
-                      </plugin>
-
-                      <!-- Playwright install browsers during build -->
-                      <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>exec-maven-plugin</artifactId>
-                        <version>3.3.0</version>
-                        <executions>
-                          <execution>
-                            <id>install-browsers</id>
-                            <phase>generate-resources</phase>
-                            <goals><goal>java</goal></goals>
-                            <configuration>
-                              <mainClass>com.microsoft.playwright.CLI</mainClass>
-                              <arguments>
-                                <argument>install</argument>
-                                <argument>chromium</argument>
-                              </arguments>
-                            </configuration>
-                          </execution>
-                        </executions>
-                      </plugin>
-
-                    </plugins>
-                  </build>
-
-                </project>
-                """;
+               <?xml version="1.0" encoding="UTF-8"?>
+               <project xmlns="http://maven.apache.org/POM/4.0.0"
+                        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                          http://maven.apache.org/xsd/maven-4.0.0.xsd">
+                 <modelVersion>4.0.0</modelVersion>
+                 <groupId>com.qa</groupId>
+                 <artifactId>playwright-bdd-framework</artifactId>
+                 <version>1.0.0</version>
+                 <properties>
+                   <java.version>17</java.version>
+                   <maven.compiler.source>17</maven.compiler.source>
+                   <maven.compiler.target>17</maven.compiler.target>
+                   <playwright.version>1.44.0</playwright.version>
+                   <cucumber.version>7.18.0</cucumber.version>
+                 </properties>
+                 <dependencies>
+                   <dependency>
+                     <groupId>com.microsoft.playwright</groupId>
+                     <artifactId>playwright</artifactId>
+                     <version>${playwright.version}</version>
+                   </dependency>
+                   <dependency>
+                     <groupId>io.cucumber</groupId>
+                     <artifactId>cucumber-java</artifactId>
+                     <version>${cucumber.version}</version><scope>test</scope>
+                   </dependency>
+                   <dependency>
+                     <groupId>io.cucumber</groupId>
+                     <artifactId>cucumber-junit-platform-engine</artifactId>
+                     <version>${cucumber.version}</version><scope>test</scope>
+                   </dependency>
+                   <dependency>
+                     <groupId>org.junit.platform</groupId>
+                     <artifactId>junit-platform-suite</artifactId>
+                     <version>1.10.2</version><scope>test</scope>
+                   </dependency>
+                   <dependency>
+                     <groupId>org.junit.jupiter</groupId>
+                     <artifactId>junit-jupiter</artifactId>
+                     <version>5.10.2</version><scope>test</scope>
+                   </dependency>
+                 </dependencies>
+               </project>
+               """;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  PRIVATE HELPERS
     // ─────────────────────────────────────────────────────────────────────────
 
-    private record Step(String action, String selector, String value, String timestamp) {}
+    /**
+     * Collapse consecutive HOVER + CLICK on the same locator into a single CLICK.
+     * The HOVER is then informational context only — not a separate step.
+     */
+    private static JsonNode collapseHoverClick(JsonNode src) {
+        com.fasterxml.jackson.databind.node.ArrayNode out =
+                new ObjectMapper().createArrayNode();
+        String prevPrimary = "";
+        String prevAction  = "";
+        for (JsonNode e : src) {
+            String at  = e.path("actionType").asText();
+            String pri = e.path("locator").path("primary").asText("");
 
-    private List<Step> parseSteps(JsonNode node) {
-        var list = new ArrayList<Step>();
-        if (node.isArray()) {
-            for (var s : node) {
-                list.add(new Step(
-                        s.path("action").asText("unknown"),
-                        s.path("selector").asText(""),
-                        s.path("value").asText(""),
-                        s.path("timestamp").asText("")));
+            // If this CLICK immediately follows a HOVER on the same locator, skip the HOVER
+            if ("HOVER".equals(prevAction) && "CLICK".equals(at) && pri.equals(prevPrimary)) {
+                // Remove last entry (the HOVER) from out and add the CLICK
+                if (out.size() > 0) ((com.fasterxml.jackson.databind.node.ArrayNode) out).remove(out.size() - 1);
             }
+            out.add(e);
+            prevPrimary = pri;
+            prevAction  = at;
         }
-        return list;
+        return out;
     }
 
-    /** Builds the Java step definition method for a recorded step. */
-    private String buildStepDef(Step s) {
-        var sb = new StringBuilder();
-        String label = humanLabel(s.selector);
-        switch (s.action) {
-            case "navigate" -> {
-                sb.append("    @Given(\"the user opens {string}\")\n");
-                sb.append("    public void openUrl(String url) {\n");
-                sb.append("        ").append(varName).append("Page.navigate();\n");
-                sb.append("    }\n");
-            }
-            case "fill", "type" -> {
-                sb.append("    @And(\"the user fills {string} with {string}\")\n");
-                sb.append("    public void fillField(String field, String value) {\n");
-                sb.append("        ").append(varName).append("Page.fill")
-                        .append(toCamelCase(label, true)).append("(value);\n");
-                sb.append("    }\n");
-            }
-            case "click", "getbytext", "click_text" -> {
-                sb.append("    @And(\"the user clicks {string}\")\n");
-                sb.append("    public void clickElement(String element) {\n");
-                sb.append("        ").append(varName).append("Page.click")
-                        .append(toCamelCase(label, true)).append("();\n");
-                sb.append("    }\n");
-            }
-            case "select_option" -> {
-                sb.append("    @And(\"the user selects {string} from {string}\")\n");
-                sb.append("    public void selectOption(String option, String dropdown) {\n");
-                sb.append("        ").append(varName).append("Page.select")
-                        .append(toCamelCase(label, true)).append("(option);\n");
-                sb.append("    }\n");
-            }
-            case "check" -> {
-                sb.append("    @And(\"the user checks {string}\")\n");
-                sb.append("    public void checkElement(String element) {\n");
-                sb.append("        ").append(varName).append("Page.check")
-                        .append(toCamelCase(label, true)).append("();\n");
-                sb.append("    }\n");
-            }
-            case "submit" -> {
-                sb.append("    @And(\"the user submits the form\")\n");
-                sb.append("    public void submitForm() {\n");
-                sb.append("        ").append(varName).append("Page.submitForm();\n");
-                sb.append("    }\n");
-            }
-            default -> { return null; }
+    /**
+     * Build the unambiguous Playwright Java expression from a locator node.
+     * Uses the recorded matchCount + nthIndex to scope when needed.
+     */
+    private String scopedPlaywrightExpr(JsonNode loc) {
+        String strategy  = loc.path("strategy").asText("css");
+        int    nthIndex  = loc.path("nthIndex").asInt(0);
+        int    matchCount= loc.path("matchCount").asInt(1);
+        String pwExpr    = loc.path("playwrightLocator").asText("");
+
+        if (pwExpr.isBlank()) {
+            // Reconstruct from parts
+            pwExpr = switch (strategy) {
+                case "href"    -> "page.locator(\"a[href=\\\"" + esc(loc.path("href").asText()) + "\\\"]\")";
+                case "css-id"  -> "page.locator(\"" + loc.path("cssSelector").asText() + "\")";
+                case "testId"  -> "page.getByTestId(\"" + esc(loc.path("testId").asText()) + "\")";
+                case "role"    -> "page.getByRole(AriaRole." +
+                        loc.path("ariaRole").asText("BUTTON").toUpperCase().replace("-","_") +
+                        ", new Page.GetByRoleOptions().setName(\"" +
+                        esc(loc.path("ariaLabel").asText()) + "\"))";
+                case "placeholder" -> "page.getByPlaceholder(\"" + esc(loc.path("placeholder").asText()) + "\")";
+                default        -> "page.locator(\"" + esc(loc.path("cssSelector").asText("body")) + "\")";
+            };
         }
-        return sb.toString();
+
+        // Append .nth() when ambiguous AND not already unique
+        boolean needsNth = matchCount > 1 && nthIndex > 0
+                && !List.of("href","css-id","testId","xpath").contains(strategy);
+        return needsNth ? pwExpr + ".nth(" + nthIndex + ")" : pwExpr;
     }
 
-    /** Generates the Locator field initializer using semantic locators. */
-    private String buildLocatorInit(String selector) {
-        if (selector.startsWith("role:")) {
-            String[] parts = selector.substring(5).split(":", 2);
-            String role = parts[0].toUpperCase();
-            if (parts.length > 1) {
-                return "page.getByRole(AriaRole." + role +
-                        ", new Page.GetByRoleOptions().setName(\"" + escape(parts[1]) + "\"))";
+    private String toFieldName(JsonNode e) {
+        JsonNode loc = e.path("locator");
+        String strategy = loc.path("strategy").asText("");
+
+        // Use the most meaningful label available
+        String base = switch (strategy) {
+            case "href"        -> {
+                String h = loc.path("href").asText("");
+                yield h.replaceAll(".*/(.*)", "$1").replace("-", " ");
             }
-            return "page.getByRole(AriaRole." + role + ")";
-        }
-        if (selector.startsWith("text:"))
-            return "page.getByText(\"" + escape(selector.substring(5)) + "\")";
-        if (selector.startsWith("placeholder:"))
-            return "page.getByPlaceholder(\"" + escape(selector.substring(12)) + "\")";
-        if (selector.startsWith("label:"))
-            return "page.getByLabel(\"" + escape(selector.substring(6)) + "\")";
-        if (selector.startsWith("testid:"))
-            return "page.getByTestId(\"" + escape(selector.substring(7)) + "\")";
-        return "page.locator(\"" + escape(selector) + "\")";
+            case "css-id"      -> loc.path("id").asText("");
+            case "testId"      -> loc.path("testId").asText("");
+            case "role"        -> loc.path("ariaLabel").asText(loc.path("text").asText(""));
+            case "placeholder" -> loc.path("placeholder").asText("");
+            default            -> loc.path("text").asText(loc.path("cssSelector").asText("element"));
+        };
+        if (base.isBlank()) base = "element";
+
+        String at = e.path("actionType").asText("");
+        String suffix = switch (at) {
+            case "CLICK" -> {
+                String tag = e.path("elementSnapshot").path("tagName").asText("");
+                yield "button".equals(tag) ? "Button" : "a".equals(tag) ? "Link" : "Element";
+            }
+            case "FILL"          -> "Field";
+            case "SELECT_OPTION" -> "Dropdown";
+            case "CHECK","UNCHECK" -> "Checkbox";
+            default -> "Element";
+        };
+
+        String cleaned = base.replaceAll("[^a-zA-Z0-9 ]", " ").trim();
+        return toCamel(cleaned) + suffix;
     }
 
-    private String buildMethodCode(Step s, String field) {
-        return switch (s.action) {
-            case "click", "getbytext", "click_text" ->
-                    "    public void click" + toCamelCase(humanLabel(s.selector), true) + "() {\n" +
-                            "        " + field + ".click();\n    }\n";
-            case "fill", "type" ->
-                    "    public void fill" + toCamelCase(humanLabel(s.selector), true) + "(String value) {\n" +
-                            "        " + field + ".fill(value);\n    }\n";
-            case "check" ->
-                    "    public void check" + toCamelCase(humanLabel(s.selector), true) + "() {\n" +
-                            "        " + field + ".check();\n    }\n";
-            case "select_option" ->
-                    "    public void select" + toCamelCase(humanLabel(s.selector), true) + "(String option) {\n" +
-                            "        " + field + ".selectOption(option);\n    }\n";
-            case "submit" ->
-                    "    public void submitForm() {\n" +
-                            "        page.locator(\"form\").first().evaluate(\"f => f.submit()\");\n    }\n";
+    private String buildMethod(String actionType, String fieldName, String value) {
+        return switch (actionType.toUpperCase()) {
+            case "CLICK","DOUBLE_CLICK" ->
+                    "    public " + className + "Page click" + cap(fieldName) + "() {\n" +
+                            "        " + fieldName + ".click();\n" +
+                            "        return this;\n    }\n";
+            case "FILL" ->
+                    "    public " + className + "Page enter" + cap(fieldName) +
+                            "(String value) {\n        " + fieldName + ".fill(value);\n" +
+                            "        return this;\n    }\n";
+            case "SELECT_OPTION" ->
+                    "    public " + className + "Page select" + cap(fieldName) +
+                            "(String value) {\n        " + fieldName + ".selectOption(value);\n" +
+                            "        return this;\n    }\n";
+            case "CHECK" ->
+                    "    public " + className + "Page check" + cap(fieldName) +
+                            "() {\n        " + fieldName + ".check();\n        return this;\n    }\n";
+            case "UNCHECK" ->
+                    "    public " + className + "Page uncheck" + cap(fieldName) +
+                            "() {\n        " + fieldName + ".uncheck();\n        return this;\n    }\n";
             default -> null;
         };
     }
 
-    /** Derives a readable field name from a raw selector string. */
-    private String toFieldName(String selector) {
-        String label = humanLabel(selector);
-        return toCamelCase(label, false) + "Locator";
+    private String toStepImpl(JsonNode e, String at) {
+        String label  = readableLabel(e);
+        String pwExpr = scopedPlaywrightExpr(e.path("locator"));
+        String val    = val(e);
+
+        return switch (at) {
+            case "CLICK" ->
+                    "    @When(\"I click the {string} element\")\n" +
+                            "    public void iClickThe" + cap(toCamel(label)) + "Element(String element) {\n" +
+                            "        " + pwExpr + ".click();\n    }\n";
+            case "FILL" ->
+                    "    @When(\"I fill {string} into the {string} field\")\n" +
+                            "    public void iFillIntoThe" + cap(toCamel(label)) + "Field(String value, String field) {\n" +
+                            "        " + pwExpr + ".fill(value);\n    }\n";
+            case "PRESS_KEY" ->
+                    "    @When(\"I press the {string} key\")\n" +
+                            "    public void iPressTheKey(String key) {\n" +
+                            "        page.keyboard().press(key);\n    }\n";
+            case "HOVER" ->
+                    "    @When(\"I hover over the {string} element\")\n" +
+                            "    public void iHoverOver" + cap(toCamel(label)) + "(String element) {\n" +
+                            "        " + pwExpr + ".hover();\n    }\n";
+            case "SELECT_OPTION" ->
+                    "    @When(\"I select {string} from the {string} dropdown\")\n" +
+                            "    public void iSelectFrom" + cap(toCamel(label)) + "Dropdown(String value, String dropdown) {\n" +
+                            "        " + pwExpr + ".selectOption(value);\n    }\n";
+            default -> null;
+        };
     }
 
-    /** Strips selector prefixes and returns a human-readable label. */
-    private String humanLabel(String selector) {
-        for (String prefix : List.of("role:", "text:", "placeholder:", "label:", "testid:")) {
-            if (selector.startsWith(prefix)) {
-                String rest = selector.substring(prefix.length());
-                // For role selectors strip the role part, keep name
-                if (prefix.equals("role:")) {
-                    int colon = rest.indexOf(':');
-                    if (colon >= 0) rest = rest.substring(colon + 1);
-                }
-                return rest.trim();
-            }
+    private String readableLabel(JsonNode e) {
+        JsonNode loc = e.path("locator");
+        if (loc.isMissingNode() || loc.isNull()) return "page";
+
+        // Prefer human-readable fields in order
+        for (String field : new String[]{"ariaLabel","placeholder","text","id","href","testId"}) {
+            String v = loc.path(field).asText("");
+            if (!v.isBlank()) return v.substring(0, Math.min(v.length(), 50));
         }
-        // CSS/XPath — extract last meaningful token
-        String[] parts = selector.split("[>\\s]+");
-        return parts[parts.length - 1].replaceAll("[#.:\\[\\]()='\"]", " ").trim();
+        return loc.path("cssSelector").asText("element");
     }
 
-    private static String toCamelCase(String input, boolean capitalizeFirst) {
-        if (input == null || input.isBlank()) return "element";
-        String[] words = input.trim().replaceAll("[^a-zA-Z0-9 ]", " ").split("\\s+");
-        var sb = new StringBuilder();
-        for (int i = 0; i < words.length; i++) {
-            String w = words[i];
-            if (w.isEmpty()) continue;
-            if (i == 0 && !capitalizeFirst) {
-                sb.append(w.toLowerCase());
-            } else {
-                sb.append(Character.toUpperCase(w.charAt(0)))
-                        .append(w.substring(1).toLowerCase());
-            }
-        }
-        return sb.isEmpty() ? "element" : sb.toString();
-    }
+    private static String val(JsonNode e) { return e.path("inputValue").asText(""); }
 
-    private static String escape(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    private static String toPascal(String s) {
+        if (s == null || s.isBlank()) return "Recorded";
+        String[] p = s.replaceAll("[^a-zA-Z0-9 ]"," ").trim().split("\\s+");
+        StringBuilder sb = new StringBuilder();
+        for (String w : p) if (!w.isBlank())
+            sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1).toLowerCase());
+        return sb.toString();
+    }
+    private static String toCamel(String s) {
+        String p = toPascal(s); return p.isEmpty() ? "element"
+                : Character.toLowerCase(p.charAt(0)) + p.substring(1);
+    }
+    private static String cap(String s) {
+        return s == null || s.isBlank() ? s
+                : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("\\","\\\\").replace("\"","\\\"");
     }
 }

@@ -1,23 +1,15 @@
 {
-  "_comment": "MCP server registration config — paste the 'playwright-mcp' block into your MCP host's config.",
-
-  "mcpServers": {
-    "playwright-mcp": {
+  "servers": {
+    "playwright-mcp-server": {
+      "type": "stdio",
       "command": "java",
       "args": [
         "-jar",
-        "/ABSOLUTE/PATH/TO/playwright-mcp-server/target/playwright-mcp-server-1.0.0-SNAPSHOT.jar"
+        "/Users/shoaibahmed/Automation/playwright-mcp-server/target/playwright-mcp-server-1.0.0-SNAPSHOT.jar"
       ],
       "env": {
-        "PLAYWRIGHT_BROWSERS_PATH": "/ABSOLUTE/PATH/TO/playwright-browsers"
+        "DEBUG": "true"
       }
     }
-  },
-
-  "quickstart": {
-    "step1_build": "mvn clean package -DskipTests",
-    "step2_install_browsers": "mvn exec:java@install-browsers",
-    "step3_register": "Add the mcpServers block above to your MCP host config (e.g. claude_desktop_config.json)",
-    "step4_verify": "Restart the MCP host and call start_recording({url:'https://example.com'})"
   }
 }
