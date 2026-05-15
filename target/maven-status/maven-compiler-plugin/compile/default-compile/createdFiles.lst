@@ -1,3 +1,7 @@
+com/qa/mcp/IntentAnalyzer$MatchResult.class
+com/qa/mcp/IntentAnalyzer$Intent.class
 com/qa/mcp/PlaywrightMcpServer.class
+com/qa/mcp/IntentAnalyzer.class
 com/qa/mcp/BddCodeGenerator.class
-com/qa/mcp/BddCodeGenerator$Step.class
+com/qa/mcp/PlaywrightMcpServer$PlaywrightAction.class
+com/qa/mcp/IntentAnalyzer$IntentType.class

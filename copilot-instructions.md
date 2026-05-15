@@ -1,183 +1,339 @@
 # Playwright MCP Server — Copilot Agent Instructions
-<!-- 
-  FILE LOCATION GUIDE (read this first):
-  ───────────────────────────────────────
-  VS Code / GitHub Copilot:  .github/copilot-instructions.md   ← primary
-                          OR .vscode/copilot-instructions.md
-  IntelliJ AI Assistant:     .github/copilot-instructions.md   ← same file, auto-read
-  Eclipse Copilot:           .github/copilot-instructions.md   ← same file, auto-read
-
-  This file is automatically loaded into every Copilot chat context.
-  KEEP IT CONCISE — every line costs tokens on every message.
-  Rules here replace verbose user prompts. One rule here = 0 tokens per conversation.
+<!--
+  FILE LOCATION — place at:  <project-root>/.github/copilot-instructions.md
+  Auto-read by: VS Code Copilot · IntelliJ AI Assistant · Eclipse Copilot
+  KEEP CONCISE — every line loads into every chat context.
 -->
 
-## Server Identity
-- Name: `playwright-mcp-server`  Version: `4.0.0`
-- Tools: `start_recording` · `stop_recording` · `playback_recording` · `generate_playwright_bdd` · `execute_atomic_action`
-- Schema version in all recordings: `4.0.0`
+---
+
+## 1. Server Identity
+
+| Property | Value |
+|---|---|
+| Name | `playwright-mcp-server` |
+| Version | `6.0.0` · Schema `6.0.0` |
+| Transport | stdio (JSON-RPC 2.0) |
+| Tools | `start_recording` · `stop_recording` · `playback_recording` · `generate_playwright_bdd` · `execute_atomic_action` |
 
 ---
 
-## Tool Quick Reference
+## 2. Short-form Commands (always use these — saves 80% tokens)
 
-| What I say | Tool to call | Required args |
-|---|---|---|
-| "open/navigate/go to [url]" | `start_recording` | `url` |
-| "start recording [name]" | `start_recording` | `url`, `sessionName` |
-| "stop / done / save recording" | `stop_recording` | _(none)_ |
-| "replay / playback / run [file]" | `playback_recording` | `jsonRecording` |
-| "generate BDD / convert to script" | `generate_playwright_bdd` | `jsonRecording`, `featureName` |
-| "click / fill / press on active page" | `execute_atomic_action` | `action`, `selector`, `value` |
+| Type this | Expands to |
+|---|---|
+| `record "<name>" on <url>` | `start_recording url=<url> sessionName=<name>` |
+| `stop` | `stop_recording` |
+| `replay <json>` | `playback_recording jsonRecording=<json>` |
+| `bdd "<name>"` | `generate_playwright_bdd featureName=<name>` using last recording |
+| `bdd "<name>" framework=testng` | same + TestNG runner |
+| `bdd "<name>" tags="@smoke @e2e"` | same + custom tags |
+| `click <selector>` | `execute_atomic_action action=click selector=<selector>` |
+| `fill <selector> with <value>` | `execute_atomic_action action=fill selector=<selector> value=<value>` |
+| `screenshot` | `execute_atomic_action action=screenshot value=./screenshot.png` |
 
 ---
 
-## Recording Workflow — Exact Steps
+## 3. Recording Workflow — Exact Steps
 
 ```
 1. start_recording  url="<url>"  sessionName="<Feature - Scenario>"
-2. [User interacts with browser — do NOT call any tools during this phase]
-3. stop_recording   → returns JSON block
+2. [User interacts with browser — call NO tools during this phase]
+3. stop_recording   → returns JSON with events + detected intents
 4. Save JSON to ./recordings/<name>.json
 ```
 
-**Do NOT call any other tool between `start_recording` and `stop_recording`.**  
-**Do NOT navigate programmatically during recording** — user drives the browser.
+**Hard rules:**
+- Never call any tool between `start_recording` and `stop_recording`
+- Never navigate programmatically during recording — user drives the browser
+- Always pass `sessionName` — it becomes the BDD feature and scenario name
+- Always use `headless: false` during recording (user must see the browser)
 
 ---
 
-## Locator Priority (v4 engine — highest to lowest)
+## 4. Locator Priority (v6 engine — highest to lowest)
 
-1. `href`  → `page.locator("a[href='/path']")`  — nav links, always unique  
-2. `css-id` → `page.locator("#escaped-id")`  — IDs with special chars handled  
-3. `testId` → `page.getByTestId("...")`  
-4. `xpath`  → `page.locator("xpath=...")`  — scoped to parent with ID  
-5. `role`   → `page.getByRole(AriaRole.X, …setName("…")).nth(n)` if ambiguous  
-6. `css`    → `page.locator("nth-scoped > path").nth(n)` if matchCount > 1  
-7. `text`   → `page.getByText("…").nth(n)` — LAST RESORT only  
+1. `href`        → `page.locator("a[href='/path']")` — nav links, always unique
+2. `css-id`      → `page.locator("#escaped-id")`
+3. `testId`      → `page.getByTestId("...")`
+4. `xpath`       → `page.locator("xpath=...")`
+5. `role`        → `page.getByRole(AriaRole.X, …setName("…")).nth(n)`
+6. `placeholder` → `page.getByPlaceholder("...")`
+7. `css`         → `page.locator("nth-scoped > path").nth(n)` if `matchCount > 1`
+8. `text`        → `page.getByText("…").nth(n)` — last resort only
 
-**When reading a recording JSON, always use `locator.playwrightLocator` field.**  
+Always read `locator.playwrightLocator` from recording JSON.  
 Never use bare `page.getByText()` without `.nth()` when `matchCount > 1`.
 
 ---
 
-## Playback Rules
+## 5. Playback Rules
 
-- **FOCUS events → skip**. They are informational, not interactive.
-- **HOVER events → skip if immediately followed by CLICK on same locator.**
-- After NAVIGATE → wait for the next actionable element with `page.waitForLoadState()`.
-- If `locator.matchCount > 1` → scope with `.nth(locator.nthIndex)`.
-- On any failure → call `execute_atomic_action` with `action=screenshot` immediately.
-
----
-
-## BDD Generation Rules
-
-**Always generate all 4 files:**
-```
-src/test/resources/features/<FeatureName>.feature
-src/test/java/com/qa/pages/<FeatureName>Page.java
-src/test/java/com/qa/stepdefs/<FeatureName>Steps.java
-src/test/java/com/qa/runners/<FeatureName>Runner.java
-```
-
-**Page Object rules:**
-- Constructor injection only — no static `page` fields
-- Locators as `private final Locator` fields, initialised in constructor
-- Action methods return `this` (fluent) unless navigation occurs → return new Page Object
-- Never put assertions inside Page Objects
-- Use `scopedPlaywrightExpr()` logic: append `.nth(nthIndex)` when `matchCount > 1`
-
-**Step definition rules:**
-- FOCUS steps → omit entirely
-- HOVER+CLICK collapse → one CLICK step
-- Credentials/passwords → `getProperty("key")` never hardcoded
-- Assertions → `assertThat(page.locator(...)).hasText(...)` not `assertTrue`
+- `FOCUS` events → **skip** (informational — never replay)
+- `HOVER` immediately before `CLICK` on same locator → skip the HOVER
+- After `NAVIGATE` → `page.waitForLoadState()` before next action
+- `matchCount > 1` → `.nth(locator.nthIndex)` scoping
+- On any failure → screenshot immediately, then attempt `recoverPageState()`
+- Max step delay: **500ms** — never use human recording timing (old cap was 2500ms)
 
 ---
 
-## Short-form Commands I Understand
+## 6. BDD Generation Rules
 
-| Short phrase | What it means |
+### 6.1 Generate exactly 3 files — nothing else
+
+```
+src/test/resources/features/<Name>.feature
+src/test/java/com/qa/pages/<Name>Page.java
+src/test/java/com/qa/stepdefs/<Name>Steps.java
+```
+
+If a Page Object or Steps class already exists → append new methods only, do not replace the whole file.
+
+### 6.2 Files that must NEVER be generated or overwritten
+
+| File | Why |
 |---|---|
-| `record <url>` | `start_recording url=<url> sessionName="Recording"` |
-| `record "<name>" on <url>` | `start_recording` with both args |
-| `stop` | `stop_recording` |
-| `replay <json>` | `playback_recording jsonRecording=<json>` |
-| `bdd "<name>"` | `generate_playwright_bdd featureName=<name>` using last recording |
-| `click <selector>` | `execute_atomic_action action=click selector=<selector>` |
-| `fill <selector> with <value>` | `execute_atomic_action action=fill selector=<selector> value=<value>` |
+| `pom.xml` | Stable — never touch |
+| `UiActions.java` | Exists at `com.qa.actions` — never regenerate |
+| `PlaywrightUiActions.java` | Exists — never regenerate |
+| Any `*Runner.java` | Two runners cover all features — never generate per-feature runners |
+| Any `*.properties` | One `test.properties` for whole project — never generate per-feature |
+| Any `*.md` | Not code — never generate |
+
+### 6.3 Feature file rules
+
+- Default tags: `@smoke @regression` on every Scenario
+- Use `Scenario Outline` + `Examples` table when `dataRows` param is supplied
+- `FOCUS` events → no Gherkin step generated
+- Consecutive `HOVER` + `CLICK` on same element → single `When I click` step
+- Never hardcode passwords in Gherkin — use `"<password>"` placeholder
+
+### 6.4 Page Object rules — CRITICAL
+
+**Correct pattern (matches existing `ParabankAccountOpeningPage` and `EcommerceworkflowPage`):**
+
+```java
+// ✅ CORRECT — String constants, matches existing framework
+private final String USERNAME_FIELD = "#loginPanel > form > div:nth-of-type(1) > input";
+private final String LOGIN_BUTTON   = "a[href='/login']";
+
+public LoginPage enterUsername(String value) {
+    ui.fill(USERNAME_FIELD, value);   // delegates to UiActions
+    return this;
+}
+```
+
+```java
+// ❌ WRONG — Locator object fields, do NOT generate this
+private final Locator usernameField = page.getByPlaceholder("Email");
+```
+
+Additional rules:
+- Constructor: `public <Name>Page(Page page, UiActions ui)` — always both args
+- `waitForPageLoad()` → calls `ui.waitForNetworkIdle()`
+- `getCurrentUrl()` → calls `ui.getCurrentUrl()`
+- `getPageTitle()` → calls `ui.getPageTitle()`
+- Getter methods: `getText()`, `isVisible()`, `isEnabled()`, `waitForVisible()`
+- Never put assertions inside Page Objects
+- Full JavaDoc on every public method
+
+### 6.5 Step Definition rules — CRITICAL
+
+**No `@Before` / `@After` ever — these live in `Hooks.java` only.**  
+**No browser lifecycle code — managed centrally by `Hooks.java`.**
+
+Correct skeleton:
+```java
+public class <Name>Steps {
+    private final ScenarioContext context;
+    private final <Name>Page      <name>Page;
+
+    // Cucumber injects shared context via constructor (PicoContainer)
+    public <Name>Steps(ScenarioContext context) {
+        this.context   = context;
+        this.<name>Page = new <Name>Page(context.getPage(), context.getUiActions());
+    }
+
+    // Only @Given / @When / @Then / @And here — NEVER @Before or @After
+}
+```
+
+Additional rules:
+- All UI actions delegate to `<name>Page` — no direct Playwright calls in steps
+- Test data via `TestConfig.get("key")` — never inline `getProperty()` in steps
+- Assertions: `Assertions.assertTrue(condition, "descriptive failure message")`
+- `@Step(Allure)` annotation on every step method
+- `@When("user clicks the {string} button")` style for reusable steps
+
+### 6.6 Intent → Gherkin mapping
+
+The MCP server detects these patterns. One Intent = one Gherkin step, not one per DOM event.
+
+| Intent detected | Gherkin step generated |
+|---|---|
+| `LOGIN` | `When user logs in with "<username>" and "<password>"` |
+| `SEARCH` | `When user searches for "<query>"` |
+| `TRANSFER` | `When user transfers "<amount>"` |
+| `FORM_SUBMIT` | `When user submits the "<formName>" form` |
+| `NAVIGATION` | `When user navigates to "<url>"` |
+| `SELECT_FLOW` | `When user selects "<value>" from "<field>"` |
+| `UPLOAD_FLOW` | `When user uploads file "<path>"` |
+| `RAW_ACTION` | `When user clicks the "<element>" element` |
 
 ---
 
-## Token-Saving Conventions
+## 7. Framework Architecture — Read-Only Reference
 
-**Use these short forms in your prompts to reduce token consumption:**
+```
+src/test/
+├── java/com/qa/
+│   ├── actions/
+│   │   ├── UiActions.java                ← 21-method interface (NEVER regenerate)
+│   │   └── PlaywrightUiActions.java      ← SmartWait + Retry (NEVER regenerate)
+│   ├── pages/                            ← one Page Object per app page
+│   │   ├── ParabankAccountOpeningPage.java
+│   │   └── EcommerceworkflowPage.java
+│   ├── runners/                          ← EXACTLY 2 runners total
+│   │   ├── SmokeTestRunner.java          ← @smoke, all features
+│   │   └── RegressionTestRunner.java     ← @regression, all features
+│   ├── stepdefs/
+│   │   ├── ScenarioContext.java          ← shared Page + UiActions per scenario
+│   │   ├── Hooks.java                    ← @Before / @After ONLY HERE
+│   │   ├── ParabankAccountOpeningSteps.java
+│   │   └── EcommerceworkflowSteps.java
+│   └── utils/
+│       └── TestConfig.java               ← single config reader, all features
+└── resources/
+    ├── features/                         ← all .feature files
+    └── TestData/
+        └── test.properties               ← ONE file, namespaced by module
+```
 
-Instead of:
-> "Please start a recording session on the URL https://example.com and name the session Login Flow"
+### Shared class responsibilities
 
-Write:
-> `record "Login Flow" on https://example.com`
+**`ScenarioContext`** — PicoContainer-injected shared state. Holds `Playwright`, `Browser`, `BrowserContext`, `Page`, `UiActions`. One instance per scenario.
 
-Instead of:
-> "Now stop the recording and give me the JSON"
+**`Hooks.java`** — the only class with `@Before`/`@After`. `@Before` creates browser + page + context, stores in `ScenarioContext`. `@After` takes failure screenshot (if `scenario.isFailed()`), closes context → browser → playwright.
 
-Write:
-> `stop`
+**`TestConfig.get("key")`** — reads `TestData/test.properties`, falls back to env var (`KEY_NAME` → `key.name`), then to provided default. Never duplicate this logic in Steps classes.
 
-Instead of:
-> "Generate a BDD script from the above JSON with the feature name Login"
+### test.properties namespace convention
 
-Write:
-> `bdd "Login"`
+```properties
+# ── URLs ────────────────────────────────────────
+app.parabank.url=https://parabank.parasoft.com/parabank/index.htm
+app.ecommerce.url=https://automationexercise.com/login
 
-Instead of:
-> "Replay the recording from the JSON I just got back"
+# ── ParaBank ─────────────────────────────────────
+parabank.username=sahmed9
+parabank.password=${PARABANK_PASSWORD}
 
-Write:
-> `replay <paste json here>`
+# ── ECommerce ────────────────────────────────────
+ecommerce.email=sahmed9@mailinator.com
+ecommerce.password=${ECOMMERCE_PASSWORD}
+ecommerce.card.name=John Doe
+ecommerce.card.number=345262728
+ecommerce.card.cvc=311
+ecommerce.card.expiry.month=05
+ecommerce.card.expiry.year=2027
+
+# ── Browser / Timeouts ───────────────────────────
+browser.headless=true
+timeout.default=30000
+retry.max=3
+```
 
 ---
 
-## Framework Stack (for code generation)
+## 8. SmartWait Engine (v6 — built-in, no manual waits needed)
 
-```
-Java 17 · Playwright 1.44 · Cucumber 7 · JUnit 5 · Maven
-Package root: com.qa
-Page Objects:    com.qa.pages
-Step Defs:       com.qa.stepdefs
-Runners:         com.qa.runners
-Feature files:   src/test/resources/features/
-Recordings:      ./recordings/
+| Action | Pre-wait applied automatically |
+|---|---|
+| `CLICK` | DOM ready → element visible |
+| `FILL` | DOM ready → element visible → element enabled |
+| `SELECT` | DOM ready → element visible → element enabled |
+| `NAVIGATE` | Post: LOAD + NETWORKIDLE |
+| `UPLOAD_FILE` | DOM ready → element attached |
+
+Never add `Thread.sleep()` or `page.waitForTimeout()`.  
+Add `ui.waitForVisible(selector)` only when AJAX content appears after an action.
+
+---
+
+## 9. MCP Server Environment Variables
+
+```bash
+MCP_TIMEOUT_MS=30000        # per-action timeout (60000 for slow sites)
+MCP_RETRY_MAX=3             # retry attempts on transient failure
+MCP_RETRY_DELAY_MS=800      # ms between retries
+MCP_MAX_STEP_DELAY_MS=500   # max playback step delay
+MCP_LOG_LEVEL=INFO          # DEBUG for verbose locator output
+MCP_FAILURE_DIR=./mcp-failures  # screenshot + HTML dump on failure
 ```
 
 ---
 
-## What NOT to Do
+## 10. Absolute Prohibitions
 
-- ❌ Do not call `execute_atomic_action` during an active recording session
-- ❌ Do not use `page.getByText("x")` without `.nth()` when text is shared across elements
-- ❌ Do not hardcode passwords or tokens in generated code
-- ❌ Do not add `Thread.sleep()` — use `page.waitForSelector()` or `page.waitForLoadState()`
-- ❌ Do not put assertions inside Page Object classes
-- ❌ Do not call `start_recording` twice without `stop_recording` in between
-- ❌ Do not generate XPath as primary locator if `href`, `id`, or `testId` is available
+```
+❌ @Before / @After in any Steps class — only in Hooks.java
+❌ new Playwright.create() in any Steps class — only in Hooks.java
+❌ Generate *Runner.java per feature — SmokeTestRunner + RegressionTestRunner are permanent
+❌ Generate *.properties per feature — add keys to test.properties only
+❌ Overwrite pom.xml / UiActions.java / PlaywrightUiActions.java — they exist, never touch
+❌ Generate *.md files — not code
+❌ private final Locator field in Page Objects — use private final String CONSTANT
+❌ page.getByText("x") without .nth() when matchCount > 1
+❌ Thread.sleep() or page.waitForTimeout() — use SmartWait / ui.waitForVisible()
+❌ Hardcoded credentials in any .java or .feature file
+❌ Assertions inside Page Object methods
+❌ XPath as primary locator when href / id / testId is available
+❌ execute_atomic_action during active recording session
+❌ start_recording without stop_recording before calling it again
+❌ getProperty() copy-pasted into Steps — use TestConfig.get()
+```
 
 ---
 
-## Where to Place This File
+## 11. Run Commands Reference
+
+```bash
+# Smoke tests — all features
+mvn test -Dtest=SmokeTestRunner
+
+# Regression — all features
+mvn test -Dtest=RegressionTestRunner
+
+# Visible browser (debug)
+mvn test -Dtest=SmokeTestRunner -Dheadless=false
+
+# Filter by tag
+mvn test -Dtest=SmokeTestRunner "-Dcucumber.filter.tags=@e2e"
+
+# Slow site — increase timeout
+MCP_TIMEOUT_MS=60000 mvn test -Dtest=SmokeTestRunner
+
+# Reports
+open target/cucumber-reports/smoke-report.html
+mvn allure:serve
+```
+
+---
+
+## 12. Tech Stack
 
 ```
-your-project/
-├── .github/
-│   └── copilot-instructions.md    ← THIS FILE (VS Code, IntelliJ, Eclipse all read here)
-├── src/
-├── recordings/
-└── pom.xml
-```
+Java 17 · Playwright 1.44 · Cucumber 7.18 · JUnit 5.10 · Maven 3.6+
+Allure 2.27 · TestNG 7.9 (alternate runner) · SLF4J 2.0
 
-**VS Code:** Auto-loaded when `github.copilot.chat.codeGeneration.instructions` is enabled (default in Copilot 1.x+).  
-**IntelliJ:** Auto-loaded by AI Assistant when file is at `.github/copilot-instructions.md`.  
-**Eclipse:** Read by GitHub Copilot plugin from `.github/copilot-instructions.md`.  
-**Claude Desktop:** Place at project root — reference in your MCP server config as a resource.
+Package root:   com.qa
+Page Objects:   com.qa.pages
+Step Defs:      com.qa.stepdefs
+Runners:        com.qa.runners
+Utils:          com.qa.utils
+Features:       src/test/resources/features/
+Recordings:     ./recordings/
+Test data:      src/test/resources/TestData/test.properties
+Failure dumps:  ./mcp-failures/
+```
