@@ -1,4 +1,6 @@
 com/qa/mcp/IntentAnalyzer$MatchResult.class
+com/qa/mcp/BddCodeGenerator$1.class
+com/qa/mcp/BddCodeGenerator$FieldEntry.class
 com/qa/mcp/IntentAnalyzer$Intent.class
 com/qa/mcp/PlaywrightMcpServer.class
 com/qa/mcp/IntentAnalyzer.class
