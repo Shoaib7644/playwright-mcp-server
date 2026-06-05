@@ -1,426 +1,487 @@
 package com.qa.mcp;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.*;
 
 /**
- * IntentAnalyzer v6
+ * IntentAnalyzer — sliding-window greedy intent classifier for recorded Playwright events.
  *
- * Converts a flat list of raw DOM events into structured business intents.
+ * Intent types (in priority order):
+ *   LOGIN, SEARCH, TRANSFER, FORM_SUBMIT, NAVIGATION,
+ *   SELECT_FLOW, UPLOAD_FLOW, RAW_ACTION
  *
- * Detection patterns (order matters — evaluated top-down):
- * ─────────────────────────────────────────────────────────
- * LOGIN          [FILL user/email] + [FILL pass] + [CLICK submit]
- * SEARCH         [FILL query] + ([PRESS Enter] | [CLICK search-btn])
- * TRANSFER       [FILL amount] + [CLICK transfer/send/submit]
- * FORM_SUBMIT    2+ FILL events + [CLICK submit/save/confirm]
- * NAVIGATION     [NAVIGATE url]  (standalone)
- * SELECT_FLOW    [SELECT_OPTION] optionally + [CLICK confirm]
- * UPLOAD_FLOW    [UPLOAD_FILE] + optional [CLICK confirm]
- * RAW_ACTION     anything not matched above (1:1 with DOM event)
+ * Window size = 6 events. Each intent consumes its matched events; remainder is
+ * emitted as individual RAW_ACTION intents.
  */
 public class IntentAnalyzer {
 
+    // ── Intent type enum ──────────────────────────────────────────────────────
     public enum IntentType {
-        LOGIN, SEARCH, TRANSFER, FORM_SUBMIT,
-        NAVIGATION, SELECT_FLOW, UPLOAD_FLOW, RAW_ACTION
+        LOGIN, SEARCH, TRANSFER, FORM_SUBMIT, NAVIGATION,
+        SELECT_FLOW, UPLOAD_FLOW, RAW_ACTION
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    //  INTENT MODEL
+    // ═════════════════════════════════════════════════════════════════════════
     public static class Intent {
-        public final IntentType          type;
-        public final String              description;
-        public final List<ObjectNode>    sourceEvents;  // raw events that formed this intent
-        public final Map<String, String> params;        // extracted parameters
 
-        public Intent(IntentType type, String description,
-                      List<ObjectNode> sourceEvents, Map<String, String> params) {
+        public final IntentType           type;
+        public final Map<String, String>  params;
+        public final List<ObjectNode>     sourceEvents;
+
+        public Intent(IntentType type,
+                      Map<String, String> params,
+                      List<ObjectNode> sourceEvents) {
             this.type         = type;
-            this.description  = description;
-            this.sourceEvents = sourceEvents;
-            this.params       = params;
+            this.params       = Collections.unmodifiableMap(new LinkedHashMap<>(params));
+            this.sourceEvents = Collections.unmodifiableList(new ArrayList<>(sourceEvents));
         }
 
-        /** Serialize to JSON for inclusion in the recording output. */
+        // ── Gherkin step generation ───────────────────────────────────────────
+
+        /**
+         * Returns the Gherkin step string for this intent.
+         *
+         * When outline=true:
+         *   - Recognized intents use their fixed {@code <placeholder>} tokens.
+         *   - RAW_ACTION FILL steps derive placeholder names from locator metadata
+         *     so the Examples table column name matches the step token exactly.
+         *   - All other RAW_ACTION types remain literal (no parameterizable value).
+         *
+         * [IA-1 + IA-2 FIX] Original zero-arg rawGherkin() removed.
+         * toGherkinStep(boolean) now routes to rawGherkin(boolean outline).
+         */
+        public String toGherkinStep(boolean outline) {
+            return switch (type) {
+                case LOGIN -> outline
+                        ? "When user logs in with \"<username>\" and \"<password>\""
+                        : "When user logs in with \""
+                          + params.getOrDefault("username", "") + "\" and \"<password>\"";
+
+                case SEARCH -> outline
+                        ? "When user searches for \"<query>\""
+                        : "When user searches for \"" + params.getOrDefault("query", "") + "\"";
+
+                case TRANSFER -> outline
+                        ? "When user transfers \"<amount>\""
+                        : "When user transfers \"" + params.getOrDefault("amount", "") + "\"";
+
+                case FORM_SUBMIT ->
+                        "When user submits the \""
+                                + params.getOrDefault("formName", "form") + "\" form";
+
+                case NAVIGATION ->
+                        "When user navigates to \"" + params.getOrDefault("url", "") + "\"";
+
+                case SELECT_FLOW -> outline
+                        ? "When user selects \"<"
+                          + toCamel(params.getOrDefault("field", "option"))
+                          + ">\" from \""
+                          + params.getOrDefault("field", "dropdown") + "\""
+                        : "When user selects \""
+                          + params.getOrDefault("value", "") + "\" from \""
+                          + params.getOrDefault("field", "dropdown") + "\"";
+
+                case UPLOAD_FLOW -> outline
+                        ? "When user uploads file \"<filePath>\""
+                        : "When user uploads file \"" + params.getOrDefault("file", "") + "\"";
+
+                case RAW_ACTION -> rawGherkin(outline);
+            };
+        }
+
+        /**
+         * Derives a Scenario Outline placeholder name from the richest available
+         * locator metadata on a FILL event.
+         *
+         * Priority: ariaLabel → placeholder attr → name attr → id → inner text → CSS fallback.
+         * Result is lower-camelCase, matching the column header emitted by
+         * {@code BddCodeGenerator.featureFile()}.
+         *
+         * [TASK-6 / BG-8] Declared public static so BddCodeGenerator.featureFile()
+         * can call IntentAnalyzer.Intent.placeholderName(ev) without an instance.
+         *
+         * @param event a raw recorded ObjectNode — safe to call on any actionType
+         * @return camelCase placeholder name, never null, never blank
+         */
+        public static String placeholderName(ObjectNode event) {
+            if (event == null) return "value";
+            JsonNode loc  = event.path("locator");
+            JsonNode snap = event.path("elementSnapshot");
+
+            // Priority 1 — aria-label (most human-readable)
+            String v = loc.path("ariaLabel").asText("").trim();
+            if (!v.isBlank()) return toCamel(sanitizeLabel(v));
+
+            // Priority 2 — placeholder attribute
+            v = loc.path("placeholder").asText("").trim();
+            if (!v.isBlank()) return toCamel(sanitizeLabel(v));
+
+            // Priority 3 — name attribute (form field name)
+            v = loc.path("name").asText("").trim();
+            if (!v.isBlank()) return toCamel(sanitizeLabel(v));
+
+            // Priority 4 — element id
+            v = loc.path("id").asText("").trim();
+            if (!v.isBlank()) return toCamel(sanitizeLabel(v));
+
+            // Priority 5 — inner text (truncated)
+            v = snap.path("innerText").asText("").trim();
+            if (!v.isBlank() && v.length() <= 40) return toCamel(sanitizeLabel(v));
+
+            // Priority 6 — CSS selector last segment
+            v = loc.path("cssSelector").asText("").trim();
+            if (!v.isBlank()) {
+                String last = v.replaceAll(".*[>\\s]", "")
+                        .replaceAll("^[.#]", "")
+                        .replaceAll("[^a-zA-Z0-9]", " ")
+                        .trim();
+                if (!last.isBlank()) return toCamel(last);
+            }
+
+            return "value";
+        }
+
+        /** Strip leading filler verbs and articles from label strings. */
+        private static String sanitizeLabel(String raw) {
+            return raw.replaceAll("(?i)^(enter|input|type|your|the|a|an)\\s+", "")
+                    .replaceAll("[^a-zA-Z0-9 ]", " ")
+                    .trim();
+        }
+
+        /**
+         * Raw Gherkin step for RAW_ACTION intents.
+         *
+         * [TASK-6 FIX] outline boolean parameter replaces the original zero-arg method.
+         * Only FILL actions are parameterized in outline mode — CLICK, SCROLL, PRESS_KEY,
+         * NAVIGATE are structural steps with no user-supplied value that varies across rows.
+         */
+        private String rawGherkin(boolean outline) {
+            if (sourceEvents.isEmpty()) return "When user performs an action";
+
+            ObjectNode e  = sourceEvents.get(0);
+            String at     = e.path("actionType").asText();
+            String loc    = e.path("locator").path("text").asText(
+                    e.path("locator").path("ariaLabel").asText(
+                            e.path("locator").path("id").asText("element")));
+            String val    = e.path("inputValue").asText("");
+
+            // [TASK-6] In outline mode, FILL steps use a derived placeholder instead of
+            // the hardcoded recorded value — placeholder name matches the Examples column.
+            if (outline && "FILL".equals(at)) {
+                String placeholder = placeholderName(e);
+                return "When user enters \"<" + placeholder + ">\" in the \""
+                        + loc + "\" field";
+            }
+
+            return switch (at) {
+                case "CLICK"         -> "When user clicks the \""    + loc + "\" element";
+                case "FILL"          -> "When user enters \""        + val + "\" in the \"" + loc + "\" field";
+                case "SCROLL"        -> "When user scrolls the page";
+                case "PRESS_KEY"     -> "When user presses \""       + e.path("key").asText("") + "\"";
+                case "SELECT_OPTION" -> "When user selects \""       + val + "\" from \"" + loc + "\"";
+                case "CHECK"         -> "When user checks the \""    + loc + "\" checkbox";
+                case "NAVIGATE"      -> "When user navigates to \""  + e.path("inputValue").asText("") + "\"";
+                default              -> "When user performs "        + at.toLowerCase().replace("_", " ");
+            };
+        }
+
+        // ── JSON serialization ────────────────────────────────────────────────
         public ObjectNode toJson(ObjectMapper mapper) {
             ObjectNode n = mapper.createObjectNode();
-            n.put("intentType",   type.name());
-            n.put("description",  description);
-            n.put("eventCount",   sourceEvents.size());
-
+            n.put("intentType", type.name());
             ObjectNode p = mapper.createObjectNode();
             params.forEach(p::put);
             n.set("params", p);
-
-            var seqs = mapper.createArrayNode();
-            sourceEvents.forEach(e -> seqs.add(e.path("sequenceNo").asInt()));
-            n.set("sourceSequenceNumbers", seqs);
+            ArrayNode se = mapper.createArrayNode();
+            sourceEvents.forEach(se::add);
+            n.set("sourceEvents", se);
             return n;
         }
 
-        /** Gherkin step string for this intent. */
-        public String toGherkinStep(boolean outline) {
-            return switch (type) {
-                case LOGIN       -> outline
-                        ? "When user logs in with \"<username>\" and \"<password>\""
-                        : "When user logs in with \"" + params.getOrDefault("username","") + "\" and \"<password>\"";
-                case SEARCH      -> outline
-                        ? "When user searches for \"<query>\""
-                        : "When user searches for \"" + params.getOrDefault("query","") + "\"";
-                case TRANSFER    -> outline
-                        ? "When user transfers \"<amount>\""
-                        : "When user transfers \"" + params.getOrDefault("amount","") + "\"";
-                case FORM_SUBMIT -> "When user submits the \"" + params.getOrDefault("formName","form") + "\" form";
-                case NAVIGATION  -> "When user navigates to \"" + params.getOrDefault("url","") + "\"";
-                case SELECT_FLOW -> "When user selects \"" + params.getOrDefault("value","") + "\" from \"" + params.getOrDefault("field","dropdown") + "\"";
-                case UPLOAD_FLOW -> "When user uploads file \"" + params.getOrDefault("file","") + "\"";
-                case RAW_ACTION  -> rawGherkin();
-            };
-        }
-
-        private String rawGherkin() {
-            if (sourceEvents.isEmpty()) return "When user performs an action";
-            ObjectNode e   = sourceEvents.get(0);
-            String at  = e.path("actionType").asText();
-            String loc = e.path("locator").path("text").asText(
-                         e.path("locator").path("ariaLabel").asText(
-                         e.path("locator").path("id").asText("element")));
-            String val = e.path("inputValue").asText("");
-            return switch (at) {
-                case "CLICK"         -> "When user clicks the \"" + loc + "\" element";
-                case "FILL"          -> "When user enters \"" + val + "\" in the \"" + loc + "\" field";
-                case "SCROLL"        -> "When user scrolls the page";
-                case "PRESS_KEY"     -> "When user presses \"" + e.path("key").asText("") + "\"";
-                case "SELECT_OPTION" -> "When user selects \"" + val + "\" from \"" + loc + "\"";
-                case "CHECK"         -> "When user checks the \"" + loc + "\" checkbox";
-                case "NAVIGATE"      -> "When user navigates to \"" + e.path("inputValue").asText("") + "\"";
-                default              -> "When user performs " + at.toLowerCase().replace("_"," ");
-            };
-        }
-
-        /** Page Object method name for this intent. */
-        public String toMethodName() {
-            return switch (type) {
-                case LOGIN       -> "login";
-                case SEARCH      -> "search";
-                case TRANSFER    -> "transfer";
-                case FORM_SUBMIT -> "submit" + cap(params.getOrDefault("formName","Form"));
-                case NAVIGATION  -> "navigateTo";
-                case SELECT_FLOW -> "select" + cap(params.getOrDefault("field","Option"));
-                case UPLOAD_FLOW -> "uploadFile";
-                case RAW_ACTION  -> {
-                    if (sourceEvents.isEmpty()) yield "performAction";
-                    String at = sourceEvents.get(0).path("actionType").asText("ACTION");
-                    String loc = sourceEvents.get(0).path("locator").path("text")
-                                 .asText(sourceEvents.get(0).path("locator").path("id").asText("element"));
-                    yield toCamel(at.toLowerCase() + " " + loc);
-                }
-            };
-        }
-
-        /** Java method signature for this intent. */
-        public String toMethodSignature(String pageClass) {
-            return switch (type) {
-                case LOGIN       -> "public " + pageClass + "Page login(String username, String password)";
-                case SEARCH      -> "public " + pageClass + "Page search(String query)";
-                case TRANSFER    -> "public " + pageClass + "Page transfer(String amount)";
-                case FORM_SUBMIT -> "public " + pageClass + "Page " + toMethodName() + "(" + formParams() + ")";
-                case NAVIGATION  -> "public " + pageClass + "Page navigateTo(String url)";
-                case SELECT_FLOW -> "public " + pageClass + "Page " + toMethodName() + "(String value)";
-                case UPLOAD_FLOW -> "public " + pageClass + "Page uploadFile(String filePath)";
-                case RAW_ACTION  -> "public " + pageClass + "Page " + toMethodName() + "()";
-            };
-        }
-
-        private String formParams() {
-            return params.entrySet().stream()
-                    .filter(e -> !e.getKey().equals("formName"))
-                    .map(e -> "String " + toCamel(e.getKey()))
-                    .reduce((a, b) -> a + ", " + b).orElse("");
-        }
-
-        private static String cap(String s) {
-            return s == null || s.isBlank() ? "" : Character.toUpperCase(s.charAt(0)) + s.substring(1).toLowerCase();
-        }
+        // ── Helpers ───────────────────────────────────────────────────────────
         private static String toCamel(String s) {
-            if (s == null || s.isBlank()) return "action";
-            String[] p = s.replaceAll("[^a-zA-Z0-9 ]"," ").trim().split("\\s+");
-            StringBuilder sb = new StringBuilder(p[0].toLowerCase());
-            for (int i = 1; i < p.length; i++) if (!p[i].isBlank())
-                sb.append(Character.toUpperCase(p[i].charAt(0))).append(p[i].substring(1).toLowerCase());
-            return sb.toString();
+            if (s == null || s.isBlank()) return "value";
+            String[] parts = s.trim().split("[\\s_\\-]+");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length; i++) {
+                String w = parts[i].replaceAll("[^a-zA-Z0-9]", "");
+                if (w.isBlank()) continue;
+                sb.append(i == 0
+                        ? Character.toLowerCase(w.charAt(0)) + w.substring(1).toLowerCase()
+                        : Character.toUpperCase(w.charAt(0)) + w.substring(1).toLowerCase());
+            }
+            return sb.isEmpty() ? "value" : sb.toString();
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  PUBLIC API
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
+    //  ANALYZER ENTRY POINT
+    // ═════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Analyzes a list of recorded events and returns a greedy, ordered list of
+     * detected intents. The window size is 6 — each candidate window is tested
+     * against all matchers in priority order; the first match consumes its events.
+     * Unmatched events become individual RAW_ACTION intents.
+     *
+     * @param events ordered list of recorded ObjectNode events
+     * @return ordered list of detected Intent objects
+     */
     public static List<Intent> analyze(List<ObjectNode> events) {
-        List<Intent> intents = new ArrayList<>();
-        int i = 0;
-        while (i < events.size()) {
-            ObjectNode e = events.get(i);
-            String at = e.path("actionType").asText();
+        if (events == null || events.isEmpty()) return Collections.emptyList();
 
-            // Skip FOCUS — never forms an intent
-            if ("FOCUS".equals(at)) { i++; continue; }
+        List<Intent>    result    = new ArrayList<>();
+        List<ObjectNode> remaining = new ArrayList<>(events);
 
-            // Try to match an intent pattern starting at position i
-            MatchResult match = tryMatch(events, i);
-            if (match != null) {
-                intents.add(match.intent);
-                i += match.consumed;
+        while (!remaining.isEmpty()) {
+            int windowSize = Math.min(6, remaining.size());
+            List<ObjectNode> window = remaining.subList(0, windowSize);
+
+            Intent matched = tryMatch(window);
+            if (matched != null) {
+                result.add(matched);
+                remaining.subList(0, matched.sourceEvents.size()).clear();
             } else {
-                // Single RAW_ACTION for unmatched events
-                intents.add(new Intent(IntentType.RAW_ACTION,
-                        at.toLowerCase().replace("_", " "),
-                        List.of(e), Map.of()));
-                i++;
+                // No intent matched — emit the first event as a raw action
+                result.add(rawAction(remaining.get(0)));
+                remaining.remove(0);
             }
         }
-        return intents;
+        return result;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
     //  PATTERN MATCHERS
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
 
-    private static MatchResult tryMatch(List<ObjectNode> events, int start) {
-        // Collect lookahead window (up to 6 events, skipping FOCUS)
-        List<ObjectNode> window = new ArrayList<>();
-        for (int j = start; j < events.size() && window.size() < 6; j++) {
-            String at = events.get(j).path("actionType").asText();
-            if (!"FOCUS".equals(at)) window.add(events.get(j));
-        }
-        if (window.isEmpty()) return null;
-
-        // Try each pattern in priority order
-        MatchResult r;
-        if ((r = tryLogin(window))       != null) return r;
-        if ((r = trySearch(window))      != null) return r;
-        if ((r = tryTransfer(window))    != null) return r;
-        if ((r = tryFormSubmit(window))  != null) return r;
-        if ((r = tryNavigation(window))  != null) return r;
-        if ((r = trySelectFlow(window))  != null) return r;
-        if ((r = tryUploadFlow(window))  != null) return r;
+    /** Try all matchers in priority order against the current window. */
+    private static Intent tryMatch(List<ObjectNode> w) {
+        Intent m;
+        if ((m = matchLogin(w))      != null) return m;
+        if ((m = matchSearch(w))     != null) return m;
+        if ((m = matchTransfer(w))   != null) return m;
+        if ((m = matchFormSubmit(w)) != null) return m;
+        if ((m = matchNavigation(w)) != null) return m;
+        if ((m = matchSelectFlow(w)) != null) return m;
+        if ((m = matchUploadFlow(w)) != null) return m;
         return null;
     }
 
     /**
-     * LOGIN: [FILL user/email/login] + [FILL password] + [CLICK submit/login/sign-in]
+     * LOGIN: FILL(username-like) + FILL(password) + CLICK(submit-like)
+     * Optionally preceded by NAVIGATE.
      */
-    private static MatchResult tryLogin(List<ObjectNode> w) {
-        if (w.size() < 3) return null;
-        ObjectNode e0 = w.get(0), e1 = w.get(1), e2 = w.get(2);
-        if (!"FILL".equals(e0.path("actionType").asText())) return null;
-        if (!"FILL".equals(e1.path("actionType").asText())) return null;
-        if (!"CLICK".equals(e2.path("actionType").asText())) return null;
-
-        String field0 = fieldLabel(e0).toLowerCase();
-        String field1 = fieldLabel(e1).toLowerCase();
-        String btn    = btnLabel(e2).toLowerCase();
-
-        boolean isUserField = field0.contains("user") || field0.contains("email")
-                || field0.contains("login") || field0.contains("username")
-                || field0.contains("phone");
-        boolean isPassField = field1.contains("pass") || field1.contains("pwd")
-                || e1.path("elementSnapshot").path("type").asText("").equals("password");
-        boolean isSubmit    = btn.contains("log") || btn.contains("sign")
-                || btn.contains("submit") || btn.contains("enter") || btn.contains("login");
-
-        if (!isUserField || !isPassField) return null;
-
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("username", e0.path("inputValue").asText(""));
-        params.put("password", "***");
-
-        return new MatchResult(new Intent(IntentType.LOGIN,
-                "User login with username and password",
-                List.of(e0, e1, e2), params), 3);
-    }
-
-    /**
-     * SEARCH: [FILL query in search-field] + ([PRESS Enter] | [CLICK search-btn])
-     */
-    private static MatchResult trySearch(List<ObjectNode> w) {
-        if (w.size() < 2) return null;
-        ObjectNode e0 = w.get(0), e1 = w.get(1);
-        if (!"FILL".equals(e0.path("actionType").asText())) return null;
-
-        String field = fieldLabel(e0).toLowerCase();
-        boolean isSearchField = field.contains("search") || field.contains("query")
-                || field.contains("find") || field.contains("q");
-        if (!isSearchField) return null;
-
-        boolean nextIsEnter  = "PRESS_KEY".equals(e1.path("actionType").asText())
-                && "Enter".equals(e1.path("key").asText());
-        boolean nextIsSearch = "CLICK".equals(e1.path("actionType").asText())
-                && btnLabel(e1).toLowerCase().contains("search");
-
-        if (!nextIsEnter && !nextIsSearch) return null;
-
-        Map<String, String> params = Map.of("query", e0.path("inputValue").asText(""));
-        return new MatchResult(new Intent(IntentType.SEARCH,
-                "Search for: " + e0.path("inputValue").asText(""),
-                List.of(e0, e1), params), 2);
-    }
-
-    /**
-     * TRANSFER: [FILL amount/value] + [CLICK transfer/send/submit/pay]
-     */
-    private static MatchResult tryTransfer(List<ObjectNode> w) {
-        if (w.size() < 2) return null;
-        ObjectNode e0 = w.get(0), e1 = w.get(1);
-        if (!"FILL".equals(e0.path("actionType").asText())) return null;
-        if (!"CLICK".equals(e1.path("actionType").asText())) return null;
-
-        String field = fieldLabel(e0).toLowerCase();
-        String btn   = btnLabel(e1).toLowerCase();
-        boolean isAmountField = field.contains("amount") || field.contains("value")
-                || field.contains("sum") || field.contains("money") || field.contains("price");
-        boolean isTransferBtn = btn.contains("transfer") || btn.contains("send")
-                || btn.contains("pay") || btn.contains("confirm");
-
-        if (!isAmountField || !isTransferBtn) return null;
-
-        Map<String, String> params = Map.of("amount", e0.path("inputValue").asText(""));
-        return new MatchResult(new Intent(IntentType.TRANSFER,
-                "Transfer amount: " + e0.path("inputValue").asText(""),
-                List.of(e0, e1), params), 2);
-    }
-
-    /**
-     * FORM_SUBMIT: 2+ FILL events (possibly mixed with SELECT) + CLICK submit/save/confirm
-     * Collects up to 5 fill fields.
-     */
-    private static MatchResult tryFormSubmit(List<ObjectNode> w) {
-        List<ObjectNode> fillEvents = new ArrayList<>();
+    private static Intent matchLogin(List<ObjectNode> w) {
         int i = 0;
-        while (i < w.size() && i < 5) {
-            String at = w.get(i).path("actionType").asText();
-            if ("FILL".equals(at) || "SELECT_OPTION".equals(at)) {
-                fillEvents.add(w.get(i));
-                i++;
-            } else break;
-        }
-        if (fillEvents.size() < 2) return null;
-        if (i >= w.size()) return null;
+        if (w.size() > i && isAction(w.get(i), "NAVIGATE")) i++;
+        if (w.size() <= i + 2) return null;
 
-        ObjectNode submitEvent = w.get(i);
-        String at = submitEvent.path("actionType").asText();
-        boolean isSubmit = "CLICK".equals(at) || "FORM_SUBMIT".equals(at);
-        if (!isSubmit) return null;
+        ObjectNode fillUser = w.get(i);
+        ObjectNode fillPass = w.get(i + 1);
+        ObjectNode click    = w.get(i + 2);
 
-        String btn = btnLabel(submitEvent).toLowerCase();
-        boolean isSubmitBtn = btn.contains("submit") || btn.contains("save")
-                || btn.contains("confirm") || btn.contains("apply")
-                || btn.contains("next") || btn.contains("continue") || "FORM_SUBMIT".equals(at);
-        if (!isSubmitBtn) return null;
+        if (!isAction(fillUser, "FILL"))  return null;
+        if (!isAction(fillPass, "FILL"))  return null;
+        if (!isAction(click,    "CLICK")) return null;
 
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("formName", "form");
-        for (ObjectNode fe : fillEvents) {
-            String fLabel = fieldLabel(fe);
-            params.put(fLabel, fe.path("inputValue").asText(""));
-        }
+        String userLoc = locatorText(fillUser).toLowerCase();
+        String passSnap = fillPass.path("elementSnapshot").path("type").asText("").toLowerCase();
+        String passLoc  = locatorText(fillPass).toLowerCase();
 
-        List<ObjectNode> allEvents = new ArrayList<>(fillEvents);
-        allEvents.add(submitEvent);
+        boolean isUser = userLoc.contains("user") || userLoc.contains("email")
+                || userLoc.contains("login") || userLoc.contains("username");
+        boolean isPass = "password".equals(passSnap)
+                || passLoc.contains("pass") || passLoc.contains("pwd");
+        if (!isUser || !isPass) return null;
 
-        return new MatchResult(new Intent(IntentType.FORM_SUBMIT,
-                "Form submission with " + fillEvents.size() + " fields",
-                allEvents, params), allEvents.size());
+        String username = fillUser.path("inputValue").asText("");
+        if ("***REDACTED***".equals(username)) username = "<username>";
+        String password = "***REDACTED***"; // always mask
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("username", username);
+        p.put("password", password);
+
+        return new Intent(IntentType.LOGIN, p, w.subList(0, i + 3));
     }
 
     /**
-     * NAVIGATION: standalone NAVIGATE event
+     * SEARCH: FILL(search-like) + optional PRESS_KEY(Enter) or CLICK(search button)
      */
-    private static MatchResult tryNavigation(List<ObjectNode> w) {
-        ObjectNode e0 = w.get(0);
-        if (!"NAVIGATE".equals(e0.path("actionType").asText())) return null;
-        String url = e0.path("inputValue").asText(e0.path("pageUrl").asText(""));
-        return new MatchResult(new Intent(IntentType.NAVIGATION,
-                "Navigate to: " + url, List.of(e0), Map.of("url", url)), 1);
-    }
+    private static Intent matchSearch(List<ObjectNode> w) {
+        if (w.isEmpty()) return null;
+        ObjectNode fill = w.get(0);
+        if (!isAction(fill, "FILL")) return null;
 
-    /**
-     * SELECT_FLOW: [SELECT_OPTION] optionally followed by [CLICK confirm]
-     */
-    private static MatchResult trySelectFlow(List<ObjectNode> w) {
-        ObjectNode e0 = w.get(0);
-        if (!"SELECT_OPTION".equals(e0.path("actionType").asText())) return null;
-        String field = fieldLabel(e0);
-        String value = e0.path("inputValue").asText("");
-        Map<String, String> params = Map.of("field", field, "value", value);
+        String loc = locatorText(fill).toLowerCase();
+        boolean isSearch = loc.contains("search") || loc.contains("query")
+                || loc.contains("find") || loc.contains("lookup");
+        if (!isSearch) return null;
 
-        // Check if next is a confirm click
+        String query = fill.path("inputValue").asText("");
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("query", query);
+
+        int consumed = 1;
         if (w.size() > 1) {
-            String next = w.get(1).path("actionType").asText();
-            String btn  = btnLabel(w.get(1)).toLowerCase();
-            if ("CLICK".equals(next) && (btn.contains("ok") || btn.contains("confirm")
-                    || btn.contains("apply") || btn.contains("select")))
-                return new MatchResult(new Intent(IntentType.SELECT_FLOW,
-                        "Select '" + value + "' from " + field, List.of(e0, w.get(1)), params), 2);
+            ObjectNode next = w.get(1);
+            if (isAction(next, "PRESS_KEY") && "Enter".equals(next.path("key").asText(""))) consumed = 2;
+            else if (isAction(next, "CLICK") && locatorText(next).toLowerCase().contains("search")) consumed = 2;
         }
-        return new MatchResult(new Intent(IntentType.SELECT_FLOW,
-                "Select '" + value + "' from " + field, List.of(e0), params), 1);
+        return new Intent(IntentType.SEARCH, p, w.subList(0, consumed));
     }
 
     /**
-     * UPLOAD_FLOW: [UPLOAD_FILE] optionally followed by [CLICK confirm]
+     * TRANSFER: FILL(amount-like) + optional FILL + CLICK(transfer/send-like)
      */
-    private static MatchResult tryUploadFlow(List<ObjectNode> w) {
-        ObjectNode e0 = w.get(0);
-        if (!"UPLOAD_FILE".equals(e0.path("actionType").asText())) return null;
-        String file = e0.path("inputValue").asText("");
-        Map<String, String> params = Map.of("file", file);
-        if (w.size() > 1 && "CLICK".equals(w.get(1).path("actionType").asText()))
-            return new MatchResult(new Intent(IntentType.UPLOAD_FLOW,
-                    "Upload file: " + file, List.of(e0, w.get(1)), params), 2);
-        return new MatchResult(new Intent(IntentType.UPLOAD_FLOW,
-                "Upload file: " + file, List.of(e0), params), 1);
+    private static Intent matchTransfer(List<ObjectNode> w) {
+        if (w.size() < 2) return null;
+        ObjectNode fill = w.get(0);
+        if (!isAction(fill, "FILL")) return null;
+
+        String loc = locatorText(fill).toLowerCase();
+        boolean isAmount = loc.contains("amount") || loc.contains("transfer")
+                || loc.contains("send") || loc.contains("value");
+        if (!isAmount) return null;
+
+        String amount = fill.path("inputValue").asText("");
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("amount", amount);
+
+        // Find the confirming click
+        int consumed = 1;
+        for (int i = 1; i < Math.min(w.size(), 4); i++) {
+            ObjectNode ev = w.get(i);
+            if (isAction(ev, "CLICK")) {
+                String cl = locatorText(ev).toLowerCase();
+                if (cl.contains("transfer") || cl.contains("send")
+                        || cl.contains("submit") || cl.contains("confirm")) {
+                    consumed = i + 1;
+                    break;
+                }
+            }
+        }
+        return new Intent(IntentType.TRANSFER, p, w.subList(0, consumed));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * FORM_SUBMIT: FORM_SUBMIT event, or CLICK on a submit-role element.
+     */
+    private static Intent matchFormSubmit(List<ObjectNode> w) {
+        if (w.isEmpty()) return null;
+        ObjectNode ev = w.get(0);
+        if (isAction(ev, "FORM_SUBMIT")) {
+            String name = ev.path("locator").path("ariaLabel").asText(
+                    ev.path("locator").path("id").asText("form"));
+            Map<String, String> p = new LinkedHashMap<>();
+            p.put("formName", name);
+            return new Intent(IntentType.FORM_SUBMIT, p, List.of(ev));
+        }
+        if (isAction(ev, "CLICK")) {
+            String snap = ev.path("elementSnapshot").path("type").asText("").toLowerCase();
+            String loc  = locatorText(ev).toLowerCase();
+            String role = ev.path("locator").path("ariaRole").asText("").toLowerCase();
+            boolean isSubmit = "submit".equals(snap) || "submit".equals(role)
+                    || loc.contains("submit") || loc.contains("save")
+                    || loc.contains("confirm") || loc.contains("continue");
+            if (!isSubmit) return null;
+            Map<String, String> p = new LinkedHashMap<>();
+            p.put("formName", locatorText(ev));
+            return new Intent(IntentType.FORM_SUBMIT, p, List.of(ev));
+        }
+        return null;
+    }
+
+    /**
+     * NAVIGATION: NAVIGATE event, or CLICK on a link/breadcrumb.
+     */
+    private static Intent matchNavigation(List<ObjectNode> w) {
+        if (w.isEmpty()) return null;
+        ObjectNode ev = w.get(0);
+        if (isAction(ev, "NAVIGATE")) {
+            String url = ev.path("inputValue").asText(ev.path("pageUrl").asText(""));
+            Map<String, String> p = new LinkedHashMap<>();
+            p.put("url", url);
+            return new Intent(IntentType.NAVIGATION, p, List.of(ev));
+        }
+        if (isAction(ev, "CLICK")) {
+            String role = ev.path("locator").path("ariaRole").asText("").toLowerCase();
+            String href = ev.path("locator").path("href").asText("");
+            boolean isNav = "link".equals(role) || !href.isBlank();
+            if (!isNav) return null;
+            Map<String, String> p = new LinkedHashMap<>();
+            p.put("url", href.isBlank() ? locatorText(ev) : href);
+            return new Intent(IntentType.NAVIGATION, p, List.of(ev));
+        }
+        return null;
+    }
+
+    /**
+     * SELECT_FLOW: SELECT_OPTION event, or CLICK on a combobox/listbox.
+     */
+    private static Intent matchSelectFlow(List<ObjectNode> w) {
+        if (w.isEmpty()) return null;
+        ObjectNode ev = w.get(0);
+        if (!isAction(ev, "SELECT_OPTION")) {
+            if (!isAction(ev, "CLICK")) return null;
+            String role = ev.path("locator").path("ariaRole").asText("").toLowerCase();
+            if (!role.contains("combobox") && !role.contains("listbox")
+                    && !role.contains("option")) return null;
+        }
+        String field = locatorText(ev);
+        String value = ev.path("inputValue").asText(
+                ev.path("selectValues").path(0).asText(""));
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("field", field);
+        p.put("value", value);
+        return new Intent(IntentType.SELECT_FLOW, p, List.of(ev));
+    }
+
+    /**
+     * UPLOAD_FLOW: UPLOAD_FILE event.
+     */
+    private static Intent matchUploadFlow(List<ObjectNode> w) {
+        if (w.isEmpty()) return null;
+        ObjectNode ev = w.get(0);
+        if (!isAction(ev, "UPLOAD_FILE")) return null;
+        String file = ev.path("inputValue").asText("");
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("file", file);
+        return new Intent(IntentType.UPLOAD_FLOW, p, List.of(ev));
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     //  HELPERS
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
 
-    private static String fieldLabel(ObjectNode e) {
-        var loc = e.path("locator");
-        for (String f : new String[]{"ariaLabel","placeholder","name","id","text"}) {
-            String v = loc.path(f).asText("");
-            if (!v.isBlank()) return v;
-        }
-        return e.path("elementSnapshot").path("innerText").asText("field");
+    private static Intent rawAction(ObjectNode event) {
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("action", event.path("actionType").asText("UNKNOWN"));
+        p.put("locator", event.path("locator").path("primary").asText(""));
+        p.put("value",   event.path("inputValue").asText(""));
+        return new Intent(IntentType.RAW_ACTION, p, List.of(event));
     }
 
-    private static String btnLabel(ObjectNode e) {
-        var snap = e.path("elementSnapshot");
-        String txt = snap.path("innerText").asText("");
-        if (!txt.isBlank()) return txt;
-        var loc = e.path("locator");
-        return loc.path("ariaLabel").asText(loc.path("text").asText(loc.path("id").asText("btn")));
+    private static boolean isAction(ObjectNode event, String actionType) {
+        return actionType.equals(event.path("actionType").asText(""));
     }
 
-    private static String toCamel(String s) {
-        if (s == null || s.isBlank()) return "action";
-        String[] p = s.replaceAll("[^a-zA-Z0-9 ]"," ").trim().split("\\s+");
-        StringBuilder sb = new StringBuilder(p[0].toLowerCase());
-        for (int i = 1; i < p.length; i++) if (!p[i].isBlank())
-            sb.append(Character.toUpperCase(p[i].charAt(0))).append(p[i].substring(1).toLowerCase());
-        return sb.toString();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  MATCH RESULT
-    // ─────────────────────────────────────────────────────────────────────────
-    private static class MatchResult {
-        final Intent intent;
-        final int consumed; // number of raw events consumed
-        MatchResult(Intent intent, int consumed) {
-            this.intent = intent; this.consumed = consumed;
-        }
+    /** Best human-readable label for an event's locator. */
+    private static String locatorText(ObjectNode event) {
+        JsonNode loc = event.path("locator");
+        String v;
+        v = loc.path("ariaLabel").asText("").trim();    if (!v.isBlank()) return v;
+        v = loc.path("placeholder").asText("").trim();  if (!v.isBlank()) return v;
+        v = loc.path("text").asText("").trim();         if (!v.isBlank()) return v;
+        v = loc.path("id").asText("").trim();           if (!v.isBlank()) return v;
+        v = loc.path("name").asText("").trim();         if (!v.isBlank()) return v;
+        v = loc.path("cssSelector").asText("").trim();  if (!v.isBlank()) return v;
+        return "element";
     }
 }

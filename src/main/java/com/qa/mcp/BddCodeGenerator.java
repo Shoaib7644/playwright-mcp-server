@@ -1,110 +1,68 @@
 package com.qa.mcp;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.*;
 
 /**
- * BddCodeGenerator v6
+ * BddCodeGenerator — converts an analyzed recording into a complete BDD project scaffold.
  *
- * ══════════════════════════════════════════════════════════════════════
- *  NEW IN v6 (fixes 3 compilation errors + full intent-driven rewrite)
- * ══════════════════════════════════════════════════════════════════════
+ * Generates:
+ *   - Gherkin Feature file (Scenario or Scenario Outline with Examples table)
+ *   - Cucumber Step Definitions (UiActions abstraction, ScenarioContext DI)
+ *   - Page Object class (locator constants + delegating action methods)
+ *   - PlaywrightUiActions implementation (Salesforce-safe navigate, waitForSalesforceLightning)
+ *   - ScenarioContext (shared state carrier, PicoContainer compatible)
+ *   - UiActions interface
+ *   - Cucumber + TestNG + Serenity runner classes
+ *   - pom.xml
  *
- *  Constructor signature (matches PlaywrightMcpServer call at line 608):
- *    BddCodeGenerator(featureName, intents, events, dataRows, tags, framework)
- *
- *  New static methods (referenced at lines 612-613):
- *    uiActionsInterface()    → UiActions.java source
- *    playwrightUiActions()   → PlaywrightUiActions.java source
- *
- *  Intent-driven generation:
- *    - Feature file built from List<Intent> not raw events
- *    - One Gherkin step per Intent (not per DOM event)
- *    - LOGIN  → "When user logs in with <username> and <password>"
- *    - SEARCH → "When user searches for <query>"
- *    - FORM_SUBMIT → "When user submits the form"
- *    - RAW_ACTION → one step per remaining event
- *
- *  Page Object:
- *    - Uses UiActions interface (framework-agnostic)
- *    - One composite method per Intent
- *    - waitForVisible(), getText(), isVisible(), isEnabled() on every field
- *    - Full JavaDoc on all generated methods
- *
- *  Step Definitions:
- *    - Delegate to Page Object methods (no inline Playwright calls)
- *    - @Step(Allure) annotation on every step
- *    - Structured assertion messages
- *
- *  Runners:
- *    - cucumber (JUnit 5 Platform Suite)
- *    - testng   (AbstractTestNGCucumberTests + parallel DataProvider)
- *    - serenity (CucumberWithSerenity)
- *
- *  Data-driven:
- *    - dataRows → Scenario Outline + Examples table
- *    - Parameters wired into intent Gherkin steps
- * ══════════════════════════════════════════════════════════════════════
+ * Audit fixes applied:
+ *   [BG-1] Stale 'private Playwright playwright;' field removed from stepDefinitions().
+ *   [BG-2] 'import com.qa.context.ScenarioContext;' added to stepDefinitions().
+ *   [BG-3] 'import com.microsoft.playwright.options.WaitUntilState;' added to playwrightUiActions().
+ *   [BG-5] cucumber-picocontainer dependency added to pomXml().
+ *   [BG-6] Package typo fixed: com.ca.context → com.qa.context throughout.
+ *   [BG-7] rawGherkin() zero-arg method removed — now rawGherkin(boolean outline) in IntentAnalyzer.
  */
 public class BddCodeGenerator {
 
-    private final String                         featureName;
-    private final String                         className;
-    private final List<IntentAnalyzer.Intent>    intents;
-    private final JsonNode                       rawEvents;
-    private final List<Map<String, String>>      dataRows;
-    private final String                         tags;
-    private final String                         framework;
+    private final String                      featureName;
+    private final List<IntentAnalyzer.Intent> intents;
+    private final JsonNode                    allEvents;
+    private final List<Map<String, String>>   dataRows;
+    private final String                      tags;
+    private final String                      framework;
 
-    // Field registry — built once, shared across pageObject() + stepDefinitions()
-    private final Map<String, FieldEntry> fields = new LinkedHashMap<>();
-
-    private static class FieldEntry {
-        String locatorExpr;   // raw CSS selector string — value of the String constant
-        String actionType;    // FILL | CLICK | SELECT_OPTION …
-        String defaultValue;
-        String constantName;  // UPPER_SNAKE_CASE — name of the String constant field
-        FieldEntry(String locatorExpr, String actionType, String defaultValue, String constantName) {
-            this.locatorExpr  = locatorExpr;
-            this.actionType   = actionType;
-            this.defaultValue = defaultValue;
-            this.constantName = constantName;
-        }
-    }
-
-    /**
-     * Primary constructor — called from PlaywrightMcpServer.handleGenerateBdd().
-     *
-     * @param featureName  human-readable feature label
-     * @param intents      structured intents from IntentAnalyzer.analyze()
-     * @param rawEvents    original recorded events (for locator extraction)
-     * @param dataRows     optional rows for Scenario Outline
-     * @param tags         Gherkin tags e.g. "@smoke @regression"
-     * @param framework    "cucumber" | "testng" | "serenity"
-     */
     public BddCodeGenerator(String featureName,
                             List<IntentAnalyzer.Intent> intents,
-                            JsonNode rawEvents,
+                            JsonNode allEvents,
                             List<Map<String, String>> dataRows,
                             String tags,
                             String framework) {
         this.featureName = featureName;
-        this.className   = toPascal(featureName);
-        this.intents     = intents != null ? intents : List.of();
-        this.rawEvents   = rawEvents;
-        this.dataRows    = dataRows != null ? dataRows : List.of();
-        this.tags        = tags != null && !tags.isBlank() ? tags : "@smoke @regression";
+        this.intents     = intents != null ? intents : Collections.emptyList();
+        this.allEvents   = allEvents;
+        this.dataRows    = dataRows != null ? dataRows : Collections.emptyList();
+        this.tags        = tags != null ? tags : "@smoke @regression";
         this.framework   = framework != null ? framework.toLowerCase() : "cucumber";
-        buildFieldRegistry();
     }
 
     // ═════════════════════════════════════════════════════════════════════════
     //  FEATURE FILE
     // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Generates the Gherkin feature file.
+     *
+     * Scenario Outline mode is activated when dataRows is non-empty.
+     * In outline mode:
+     *   - FILL RAW_ACTION steps use {@code <placeholder>} tokens derived from locator metadata.
+     *   - The Examples table includes both caller-supplied columns and derived columns.
+     *   - Derived columns for recognized intent types (LOGIN, SEARCH, etc.) are added automatically.
+     *   - Derived columns with no value in dataRows emit {@code <colName>} as a visible reminder.
+     */
     public String featureFile() {
         StringBuilder sb = new StringBuilder();
         sb.append(tags).append("\n");
@@ -112,551 +70,533 @@ public class BddCodeGenerator {
         sb.append("  As a user\n");
         sb.append("  I want to ").append(toSentence(featureName)).append("\n");
         sb.append("  So that I achieve the expected outcome\n\n");
-
         sb.append("  Background:\n");
         sb.append("    Given the browser is open\n\n");
 
         boolean outline = !dataRows.isEmpty();
 
         if (outline) {
-            // Scenario Outline — parameters from first dataRow's keys
-            List<String> cols = new ArrayList<>(dataRows.get(0).keySet());
-            sb.append("  Scenario Outline: ").append(featureName)
-                    .append(" — <").append(cols.get(0)).append(">\n");
+            // ── Collect all placeholder columns ──────────────────────────────
+            // External columns come from the caller-supplied dataRows (preserved as-is).
+            List<String> externalCols = new ArrayList<>(dataRows.get(0).keySet());
+
+            // Derived columns: one per RAW_ACTION FILL intent not already in externalCols.
+            // Order matches step appearance in the scenario body.
+            List<String> derivedCols = new ArrayList<>();
+            for (IntentAnalyzer.Intent intent : intents) {
+                if (intent.type != IntentAnalyzer.IntentType.RAW_ACTION) continue;
+                if (intent.sourceEvents.isEmpty()) continue;
+                ObjectNode ev = intent.sourceEvents.get(0);
+                if (!"FILL".equals(ev.path("actionType").asText())) continue;
+                String ph = IntentAnalyzer.Intent.placeholderName(ev);
+                if (!externalCols.contains(ph) && !derivedCols.contains(ph)) {
+                    derivedCols.add(ph);
+                }
+            }
+
+            // Fixed placeholder columns for recognized intent types
+            // (these do not have a sourceEvents FILL event to derive from).
+            for (IntentAnalyzer.Intent intent : intents) {
+                switch (intent.type) {
+                    case LOGIN -> {
+                        if (!externalCols.contains("username") && !derivedCols.contains("username"))
+                            derivedCols.add("username");
+                        if (!externalCols.contains("password") && !derivedCols.contains("password"))
+                            derivedCols.add("password");
+                    }
+                    case SEARCH -> {
+                        if (!externalCols.contains("query") && !derivedCols.contains("query"))
+                            derivedCols.add("query");
+                    }
+                    case TRANSFER -> {
+                        if (!externalCols.contains("amount") && !derivedCols.contains("amount"))
+                            derivedCols.add("amount");
+                    }
+                    case SELECT_FLOW -> {
+                        String field = toCamel(intent.params.getOrDefault("field", "option"));
+                        if (!externalCols.contains(field) && !derivedCols.contains(field))
+                            derivedCols.add(field);
+                    }
+                    case UPLOAD_FLOW -> {
+                        if (!externalCols.contains("filePath") && !derivedCols.contains("filePath"))
+                            derivedCols.add("filePath");
+                    }
+                    default -> {}
+                }
+            }
+
+            List<String> allCols = new ArrayList<>(externalCols);
+            allCols.addAll(derivedCols);
+
+            // ── Scenario Outline block ────────────────────────────────────────
+            sb.append("  Scenario Outline: ")
+                    .append(featureName)
+                    .append(" — <")
+                    .append(allCols.isEmpty() ? "value" : allCols.get(0))
+                    .append(">\n");
+
             for (IntentAnalyzer.Intent intent : intents) {
                 String step = intent.toGherkinStep(true);
-                if (step != null) sb.append("    ").append(step).append("\n");
+                if (step != null && !step.isBlank())
+                    sb.append("    ").append(step).append("\n");
             }
+
+            // ── Examples table ────────────────────────────────────────────────
             sb.append("\n    Examples:\n");
-            sb.append("      | ").append(String.join(" | ", cols)).append(" |\n");
+            sb.append("      | ").append(String.join(" | ", allCols)).append(" |\n");
+
             for (Map<String, String> row : dataRows) {
                 sb.append("      |");
-                for (String col : cols) sb.append(" ").append(row.getOrDefault(col, "")).append(" |");
+                for (String col : allCols) {
+                    // External rows supply values; derived columns emit <colName>
+                    // as a visible reminder to the user that test data is required.
+                    sb.append(" ").append(row.getOrDefault(col, "<" + col + ">")).append(" |");
+                }
                 sb.append("\n");
             }
+
         } else {
             sb.append("  Scenario: ").append(featureName).append("\n");
             for (IntentAnalyzer.Intent intent : intents) {
                 String step = intent.toGherkinStep(false);
-                if (step != null) sb.append("    ").append(step).append("\n");
+                if (step != null && !step.isBlank())
+                    sb.append("    ").append(step).append("\n");
+            }
+        }
+
+        return sb.toString();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  STEP DEFINITIONS
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Generates the Cucumber step definitions class.
+     *
+     * Audit fixes:
+     *   [BG-1] Removed stale 'private Playwright playwright;' — Playwright is never
+     *          used directly in step classes; only context.getUiActions() is needed.
+     *   [BG-2] Added 'import com.qa.context.ScenarioContext;' — required for PicoContainer DI.
+     *   [BG-6] Package corrected to com.qa.context (was com.ca.context — typo).
+     */
+    public String stepDefinitions() {
+        String className = toPascal(featureName);
+        return "package com.qa.stepdefs;\n\n" +
+                "import com.qa.pages." + className + "Page;\n" +
+                "import com.qa.actions.UiActions;\n" +
+                // [BG-2 + BG-6 FIX] Correct package com.qa.context (not com.ca.context)
+                "import com.qa.context.ScenarioContext;\n" +
+                "import com.qa.utils.TestConfig;\n" +
+                "import io.cucumber.java.en.*;\n" +
+                "import io.qameta.allure.Step;\n" +
+                "import org.junit.jupiter.api.Assertions;\n\n" +
+                "/**\n" +
+                " * Step definitions for: " + featureName + "\n" +
+                " * If this class already exists, add only the NEW @When/@Then methods.\n" +
+                " * DO NOT duplicate Background steps — those live in a shared steps class.\n" +
+                " */\n" +
+                "public class " + className + "Steps {\n\n" +
+                // [BG-1 FIX] 'private Playwright playwright;' removed — not in scope here.
+                "    private final ScenarioContext context;\n" +
+                "    private final " + className + "Page po;\n\n" +
+                "    /** PicoContainer constructor injection. */\n" +
+                "    public " + className + "Steps(ScenarioContext context) {\n" +
+                "        this.context = context;\n" +
+                "        this.po      = new " + className + "Page(context.getPage());\n" +
+                "    }\n\n" +
+                buildStepMethods() +
+                "}\n";
+    }
+
+    private String buildStepMethods() {
+        StringBuilder sb = new StringBuilder();
+        Set<String> emitted = new LinkedHashSet<>();
+
+        for (IntentAnalyzer.Intent intent : intents) {
+            String method = buildStepMethod(intent);
+            if (method != null && !emitted.contains(method)) {
+                sb.append(method);
+                emitted.add(method);
             }
         }
         return sb.toString();
     }
 
+    private String buildStepMethod(IntentAnalyzer.Intent intent) {
+        return switch (intent.type) {
+            case LOGIN ->
+                    "    @When(\"user logs in with {string} and {string}\")\n" +
+                            "    @Step(\"Login: {0}\")\n" +
+                            "    public void userLogsIn(String username, String password) {\n" +
+                            "        po.login(username, password);\n" +
+                            "    }\n\n";
+
+            case SEARCH ->
+                    "    @When(\"user searches for {string}\")\n" +
+                            "    @Step(\"Search: {0}\")\n" +
+                            "    public void userSearchesFor(String query) {\n" +
+                            "        po.search(query);\n" +
+                            "    }\n\n";
+
+            case TRANSFER ->
+                    "    @When(\"user transfers {string}\")\n" +
+                            "    @Step(\"Transfer: {0}\")\n" +
+                            "    public void userTransfers(String amount) {\n" +
+                            "        po.transfer(amount);\n" +
+                            "    }\n\n";
+
+            case FORM_SUBMIT -> {
+                String formName = intent.params.getOrDefault("formName", "form");
+                yield "    @When(\"user submits the {string} form\")\n" +
+                        "    @Step(\"Submit form: {0}\")\n" +
+                        "    public void userSubmitsForm(String formName) {\n" +
+                        "        po.submitForm(formName);\n" +
+                        "    }\n\n";
+            }
+
+            case NAVIGATION ->
+                    "    @When(\"user navigates to {string}\")\n" +
+                            "    @Step(\"Navigate to: {0}\")\n" +
+                            "    public void userNavigatesTo(String url) {\n" +
+                            "        context.getUiActions().navigate(url);\n" +
+                            "    }\n\n";
+
+            case SELECT_FLOW -> {
+                String field = toCamel(intent.params.getOrDefault("field", "option"));
+                yield "    @When(\"user selects {string} from {string}\")\n" +
+                        "    @Step(\"Select: {0} from {1}\")\n" +
+                        "    public void userSelects(String value, String field) {\n" +
+                        "        context.getUiActions().selectOption(\"" + field + "\", value);\n" +
+                        "    }\n\n";
+            }
+
+            case UPLOAD_FLOW ->
+                    "    @When(\"user uploads file {string}\")\n" +
+                            "    @Step(\"Upload file: {0}\")\n" +
+                            "    public void userUploadsFile(String filePath) {\n" +
+                            "        context.getUiActions().uploadFile(\""
+                            + intent.params.getOrDefault("locator", "input[type='file']")
+                            + "\", filePath);\n" +
+                            "    }\n\n";
+
+            case RAW_ACTION -> buildRawStepMethod(intent);
+        };
+    }
+
+    private String buildRawStepMethod(IntentAnalyzer.Intent intent) {
+        if (intent.sourceEvents.isEmpty()) return null;
+        ObjectNode e  = intent.sourceEvents.get(0);
+        String at     = e.path("actionType").asText();
+        String loc    = e.path("locator").path("primary").asText("element");
+        String val    = e.path("inputValue").asText("");
+
+        return switch (at) {
+            case "CLICK" ->
+                    "    @When(\"user clicks the {string} element\")\n" +
+                            "    @Step(\"Click: {0}\")\n" +
+                            "    public void userClicksElement(String element) {\n" +
+                            "        context.getUiActions().click(element);\n" +
+                            "    }\n\n";
+
+            case "FILL" -> {
+                String ph = IntentAnalyzer.Intent.placeholderName(e);
+                String methodName = "userEnters" + toPascal(ph);
+                yield "    @When(\"user enters {string} in the {string} field\")\n" +
+                        "    @Step(\"Enter " + ph + ": {0}\")\n" +
+                        "    public void " + methodName + "(String value, String field) {\n" +
+                        "        context.getUiActions().fill(field, value);\n" +
+                        "    }\n\n";
+            }
+
+            case "SCROLL" ->
+                    "    @When(\"user scrolls the page\")\n" +
+                            "    @Step(\"Scroll page\")\n" +
+                            "    public void userScrollsThePage() {\n" +
+                            "        context.getUiActions().scroll(0, 300);\n" +
+                            "    }\n\n";
+
+            // [TASK-3 FIX] PRESS_KEY delegates to context.getUiActions().press(null, key).
+            // null selector routes to page.keyboard().press(key) inside PlaywrightUiActions.
+            // The original 'page.keyboard().press(key)' was a compilation error — 'page' is
+            // never in scope in a step class; only 'context' is injected.
+            case "PRESS_KEY" ->
+                    "    @When(\"user presses the {string} key\")\n" +
+                            "    @Step(\"Press key: {0}\")\n" +
+                            "    public void userPressesTheKey(String key) {\n" +
+                            "        context.getUiActions().press(null, key);\n" +
+                            "    }\n\n";
+
+            case "SELECT_OPTION" ->
+                    "    @When(\"user selects {string} from {string}\")\n" +
+                            "    @Step(\"Select option: {0} from {1}\")\n" +
+                            "    public void userSelectsOption(String value, String field) {\n" +
+                            "        context.getUiActions().selectOption(field, value);\n" +
+                            "    }\n\n";
+
+            case "CHECK" ->
+                    "    @When(\"user checks the {string} checkbox\")\n" +
+                            "    @Step(\"Check: {0}\")\n" +
+                            "    public void userChecksCheckbox(String label) {\n" +
+                            "        context.getUiActions().check(label);\n" +
+                            "    }\n\n";
+
+            case "NAVIGATE" ->
+                    "    @When(\"user navigates to {string}\")\n" +
+                            "    @Step(\"Navigate: {0}\")\n" +
+                            "    public void userNavigatesTo(String url) {\n" +
+                            "        context.getUiActions().navigate(url);\n" +
+                            "    }\n\n";
+
+            default -> null;
+        };
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE OBJECT  (UiActions-based, framework-agnostic)
+    //  PAGE OBJECT
     // ═════════════════════════════════════════════════════════════════════════
+
     public String pageObject() {
-        StringBuilder fieldDecls = new StringBuilder();
-        StringBuilder fieldInits = new StringBuilder();
-        StringBuilder methods    = new StringBuilder();
+        String className = toPascal(featureName);
+        StringBuilder locators = new StringBuilder();
+        StringBuilder methods  = new StringBuilder();
+        Set<String> seen = new LinkedHashSet<>();
 
-        // String constant declarations — matches ParabankAccountOpeningPage pattern exactly:
-        //   private final String USERNAME_FIELD = "#loginPanel > form > div:nth-of-type(1) > input";
-        for (Map.Entry<String, FieldEntry> entry : fields.entrySet()) {
-            String fname = entry.getKey();
-            FieldEntry fe = entry.getValue();
-            String constName = fe.constantName != null ? fe.constantName : toConstantName(fname);
-            fieldDecls.append("    /** ").append(fe.actionType).append(" */\n");
-            fieldDecls.append("    private final String ").append(constName)
-                    .append(" = \"").append(fe.locatorExpr.replace("\"", "\\\"")).append("\";\n");
-        }
-
-        // fieldInits not needed — String constants are inline final declarations
-
-        // Per-field action + getter methods
-        Set<String> builtMethods = new LinkedHashSet<>();
-        for (Map.Entry<String, FieldEntry> entry : fields.entrySet()) {
-            String fname = entry.getKey();
-            FieldEntry fe = entry.getValue();
-            String actionMethod = buildActionMethod(fname, fe);
-            if (actionMethod != null && builtMethods.add(fname + "_action"))
-                methods.append(actionMethod).append("\n");
-            String getters = buildGetterMethods(fname, fe.actionType);
-            if (builtMethods.add(fname + "_getters"))
-                methods.append(getters);
-        }
-
-        // Intent-level composite methods
-        Set<String> builtIntents = new LinkedHashSet<>();
         for (IntentAnalyzer.Intent intent : intents) {
-            if (intent.type == IntentAnalyzer.IntentType.RAW_ACTION) continue;
-            String sig = intent.toMethodSignature(className);
-            if (!builtIntents.add(sig)) continue;
-            methods.append(buildCompositeMethod(intent));
+            if (intent.sourceEvents.isEmpty()) continue;
+            ObjectNode e   = intent.sourceEvents.get(0);
+            String primary = e.path("locator").path("primary").asText("").trim();
+            String pw      = e.path("locator").path("playwrightLocator").asText("").trim();
+            String at      = e.path("actionType").asText();
+            if (primary.isBlank() || seen.contains(primary)) continue;
+            seen.add(primary);
+
+            String constName = toConstant(primary);
+            locators.append("    private static final String ")
+                    .append(constName).append(" = \"")
+                    .append(esc(primary)).append("\";\n");
+
+            switch (intent.type) {
+                case LOGIN  -> methods.append(loginPageMethods());
+                case SEARCH -> methods.append(searchPageMethods());
+                default     -> {
+                    if ("FILL".equals(at)) {
+                        String ph = IntentAnalyzer.Intent.placeholderName(e);
+                        methods.append("    public void enter").append(toPascal(ph))
+                                .append("(String value) {\n")
+                                .append("        uiActions.fill(").append(constName).append(", value);\n")
+                                .append("    }\n\n");
+                    } else if ("CLICK".equals(at)) {
+                        String mName = "click" + toPascal(locatorLabel(e));
+                        methods.append("    public void ").append(mName).append("() {\n")
+                                .append("        uiActions.click(").append(constName).append(");\n")
+                                .append("    }\n\n");
+                    }
+                }
+            }
         }
 
         return "package com.qa.pages;\n\n" +
-                "import com.microsoft.playwright.*;\n" +
-                "import com.microsoft.playwright.options.LoadState;\n" +
+                "import com.microsoft.playwright.Page;\n" +
                 "import com.qa.actions.UiActions;\n" +
-                "import java.nio.file.Paths;\n\n" +
+                "import com.qa.actions.PlaywrightUiActions;\n\n" +
                 "/**\n" +
-                " * Page Object — " + featureName + "\n" +
-                " * Generated by PlaywrightMcpServer v6\n" +
-                " *\n" +
-                " * Pattern: String selector constants + UiActions calls\n" +
-                " * Matches: ParabankAccountOpeningPage.java structure exactly.\n" +
-                " * Swap PlaywrightUiActions for SeleniumUiActions without touching tests.\n" +
+                " * Page Object for: " + featureName + "\n" +
+                " * If this class already exists, add only the NEW locator constants and methods.\n" +
                 " */\n" +
                 "public class " + className + "Page {\n\n" +
-                "    private final Page      page;\n" +
-                "    private final UiActions ui;\n\n" +
-                "    // ── Selector constants ────────────────────────────────────────────\n" +
-                fieldDecls + "\n" +
-                "    /**\n" +
-                "     * Construct the page object.\n" +
-                "     * @param page Playwright Page instance\n" +
-                "     * @param ui   UiActions implementation (PlaywrightUiActions or SeleniumUiActions)\n" +
-                "     */\n" +
-                "    public " + className + "Page(Page page, UiActions ui) {\n" +
-                "        this.page = page;\n" +
-                "        this.ui   = ui;\n" +
+                "    private final UiActions uiActions;\n\n" +
+                locators +
+                "\n" +
+                "    public " + className + "Page(Page page) {\n" +
+                "        this.uiActions = new PlaywrightUiActions(page);\n" +
                 "    }\n\n" +
-                "    /**\n" +
-                "     * Navigate to the given URL and wait for full page load.\n" +
-                "     * @param url full URL\n" +
-                "     * @return this page (fluent)\n" +
-                "     */\n" +
-                "    public " + className + "Page navigateTo(String url) {\n" +
-                "        ui.navigate(url);\n" +
-                "        return this;\n" +
-                "    }\n\n" +
-                "    /** Wait for network idle — call after actions that trigger slow XHR. */\n" +
-                "    public void waitForPageLoad() {\n" +
-                "        ui.waitForNetworkIdle();\n" +
-                "    }\n\n" +
-                "    /** @return current page URL */\n" +
-                "    public String getCurrentUrl()  { return ui.getCurrentUrl(); }\n\n" +
-                "    /** @return current page title */\n" +
-                "    public String getPageTitle()   { return ui.getPageTitle(); }\n\n" +
                 methods +
                 "}\n";
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    //  STEP DEFINITIONS  (delegate to Page Object methods)
-    // ═════════════════════════════════════════════════════════════════════════
-    public String stepDefinitions() {
-        StringBuilder stepImpls = new StringBuilder();
-        Set<String> seen = new LinkedHashSet<>();
+    private String loginPageMethods() {
+        return "    public void login(String username, String password) {\n" +
+                "        uiActions.fill(USERNAME_LOCATOR, username);\n" +
+                "        uiActions.fill(PASSWORD_LOCATOR, password);\n" +
+                "        uiActions.click(LOGIN_BUTTON_LOCATOR);\n" +
+                "    }\n\n";
+    }
 
-        for (IntentAnalyzer.Intent intent : intents) {
-            String key = intent.type.name() + "|" + intent.description;
-            if (seen.contains(key)) continue;
-            seen.add(key);
-            String impl = buildStepImpl(intent);
-            if (impl != null) stepImpls.append(impl).append("\n");
-        }
-
-        String po = toCamel(className) + "Page";
-
-        return "package com.qa.stepdefs;\n\n" +
-                "import com.microsoft.playwright.*;\n" +
-                "import com.qa.pages." + className + "Page;\n" +
-                "import com.qa.actions.PlaywrightUiActions;\n" +
-                "import io.cucumber.java.After;\n" +
-                "import io.cucumber.java.Before;\n" +
-                "import io.cucumber.java.en.*;\n" +
-                "import io.qameta.allure.Step;\n" +
-                "import org.junit.jupiter.api.Assertions;\n" +
-                "import java.io.IOException;\n" +
-                "import java.io.InputStream;\n" +
-                "import java.util.Properties;\n\n" +
-                "/**\n" +
-                " * Step Definitions — " + featureName + "\n" +
-                " * Generated by PlaywrightMcpServer v6\n" +
-                " * All steps delegate to {@link " + className + "Page} — no direct Playwright calls here.\n" +
-                " */\n" +
-                "public class " + className + "Steps {\n\n" +
-                "    private Playwright       playwright;\n" +
-                "    private Browser          browser;\n" +
-                "    private BrowserContext   context;\n" +
-                "    private Page             page;\n" +
-                "    private " + className + "Page " + po + ";\n\n" +
-                "    @Before\n" +
-                "    public void setUp() {\n" +
-                "        playwright = Playwright.create();\n" +
-                "        browser    = playwright.chromium().launch(\n" +
-                "                         new BrowserType.LaunchOptions().setHeadless(true));\n" +
-                "        context    = browser.newContext(\n" +
-                "                         new Browser.NewContextOptions().setBypassCSP(true));\n" +
-                "        page       = context.newPage();\n" +
-                "        " + po + " = new " + className + "Page(page, new PlaywrightUiActions(page));\n" +
-                "    }\n\n" +
-                "    @After\n" +
-                "    public void tearDown() {\n" +
-                "        if (context    != null) context.close();\n" +
-                "        if (browser    != null) browser.close();\n" +
-                "        if (playwright != null) playwright.close();\n" +
-                "    }\n\n" +
-                "    // ── Common steps ──────────────────────────────────────────────────────\n\n" +
-                "    @Given(\"the browser is open\")\n" +
-                "    public void theBrowserIsOpen() { /* ready via @Before */ }\n\n" +
-                "    @When(\"user navigates to {string}\")\n" +
-                "    @Step(\"Navigate to {0}\")\n" +
-                "    public void userNavigatesTo(String url) {\n" +
-                "        " + po + ".navigateTo(url);\n" +
-                "    }\n\n" +
-                "    @When(\"I navigate to {string}\")\n" +
-                "    @Step(\"Navigate to {0}\")\n" +
-                "    public void iNavigateTo(String url) {\n" +
-                "        " + po + ".navigateTo(url);\n" +
-                "    }\n\n" +
-                "    @When(\"I scroll the page to position {int}, {int}\")\n" +
-                "    @Step(\"Scroll to {0},{1}\")\n" +
-                "    public void iScrollThePage(int x, int y) { page.mouse().wheel(x, y); }\n\n" +
-                "    @Then(\"the URL should be {string}\")\n" +
-                "    @Step(\"Assert URL equals {0}\")\n" +
-                "    public void theUrlShouldBe(String url) {\n" +
-                "        Assertions.assertEquals(url, page.url(),\n" +
-                "            \"Expected URL '\" + url + \"' but was '\" + page.url() + \"'\");\n" +
-                "    }\n\n" +
-                "    @Then(\"I should see {string} on the page\")\n" +
-                "    @Step(\"Assert text '{0}' is visible\")\n" +
-                "    public void iShouldSeeOnThePage(String text) {\n" +
-                "        Assertions.assertTrue(\n" +
-                "            page.getByText(text).first().isVisible(),\n" +
-                "            \"Expected text '\" + text + \"' to be visible on page\");\n" +
-                "    }\n\n" +
-                "    @Then(\"the {string} element should be visible\")\n" +
-                "    @Step(\"Assert element '{0}' is visible\")\n" +
-                "    public void theElementShouldBeVisible(String element) {\n" +
-                "        Assertions.assertTrue(\n" +
-                "            page.getByText(element).first().isVisible(),\n" +
-                "            \"Element '\" + element + \"' is not visible\");\n" +
-                "    }\n\n" +
-                "    // ── Intent-driven steps ───────────────────────────────────────────────\n\n" +
-                stepImpls +
-                "    // ── Test Data ────────────────────────────────────────────────────────\n\n" +
-                "    /**\n" +
-                "     * Load a value from src/test/resources/TestData/*.properties.\n" +
-                "     * Falls back to defaultValue when key is not found.\n" +
-                "     * Usage: getProperty(\"parabank.password\", \"default\")\n" +
-                "     */\n" +
-                "    protected String getProperty(String key, String defaultValue) {\n" +
-                "        try (InputStream is = getClass().getClassLoader()\n" +
-                "                .getResourceAsStream(\"TestData/parabank.properties\")) {\n" +
-                "            if (is == null) return defaultValue;\n" +
-                "            Properties props = new Properties();\n" +
-                "            props.load(is);\n" +
-                "            return props.getProperty(key, defaultValue);\n" +
-                "        } catch (IOException e) {\n" +
-                "            return defaultValue;\n" +
-                "        }\n" +
-                "    }\n" +
-                "}\n";
+    private String searchPageMethods() {
+        return "    public void search(String query) {\n" +
+                "        uiActions.fill(SEARCH_LOCATOR, query);\n" +
+                "        uiActions.press(SEARCH_LOCATOR, \"Enter\");\n" +
+                "    }\n\n";
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  RUNNER
-    // ═════════════════════════════════════════════════════════════════════════
-    public String runner() {
-        return switch (framework) {
-            case "testng"   -> testNgRunner();
-            case "serenity" -> serenityRunner();
-            default         -> cucumberRunner();
-        };
-    }
-
-    private String cucumberRunner() {
-        String firstTag = tags.split("\\s+")[0];
-        return "package com.qa.runners;\n\n" +
-                "import io.cucumber.junit.platform.engine.Constants;\n" +
-                "import org.junit.platform.suite.api.*;\n\n" +
-                "/**\n * JUnit 5 Cucumber Runner — " + featureName + "\n * Generated by PlaywrightMcpServer v6\n */\n" +
-                "@Suite\n" +
-                "@IncludeEngines(\"cucumber\")\n" +
-                "@SelectClasspathResource(\"features\")\n" +
-                "@ConfigurationParameter(key = Constants.GLUE_PROPERTY_NAME,      value = \"com.qa.stepdefs\")\n" +
-                "@ConfigurationParameter(key = Constants.PLUGIN_PROPERTY_NAME,\n" +
-                "        value = \"pretty, " +
-                "html:target/cucumber-reports/" + className + "-report.html, " +
-                "json:target/cucumber-reports/" + className + ".json, " +
-                "io.qameta.allure.cucumber7jvm.AllureCucumber7Jvm\")\n" +
-                "@ConfigurationParameter(key = Constants.FILTER_TAGS_PROPERTY_NAME, value = \"" + firstTag + "\")\n" +
-                "public class " + className + "Runner {}\n";
-    }
-
-    private String testNgRunner() {
-        String firstTag = tags.split("\\s+")[0];
-        return "package com.qa.runners;\n\n" +
-                "import io.cucumber.testng.AbstractTestNGCucumberTests;\n" +
-                "import io.cucumber.testng.CucumberOptions;\n" +
-                "import org.testng.annotations.DataProvider;\n\n" +
-                "/**\n * TestNG Cucumber Runner — " + featureName + "\n * Generated by PlaywrightMcpServer v6\n */\n" +
-                "@CucumberOptions(\n" +
-                "    features = \"src/test/resources/features\",\n" +
-                "    glue     = \"com.qa.stepdefs\",\n" +
-                "    tags     = \"" + firstTag + "\",\n" +
-                "    plugin   = {\"pretty\",\n" +
-                "                \"html:target/cucumber-reports/" + className + "-report.html\",\n" +
-                "                \"json:target/cucumber-reports/" + className + ".json\"}\n" +
-                ")\n" +
-                "public class " + className + "Runner extends AbstractTestNGCucumberTests {\n\n" +
-                "    /** Enable parallel scenario execution. */\n" +
-                "    @Override\n" +
-                "    @DataProvider(parallel = true)\n" +
-                "    public Object[][] scenarios() {\n" +
-                "        return super.scenarios();\n" +
-                "    }\n}\n";
-    }
-
-    private String serenityRunner() {
-        String firstTag = tags.split("\\s+")[0];
-        return "package com.qa.runners;\n\n" +
-                "import net.serenitybdd.cucumber.CucumberWithSerenity;\n" +
-                "import io.cucumber.junit.CucumberOptions;\n" +
-                "import org.junit.runner.RunWith;\n\n" +
-                "/**\n * Serenity BDD Runner — " + featureName + "\n * Generated by PlaywrightMcpServer v6\n */\n" +
-                "@RunWith(CucumberWithSerenity.class)\n" +
-                "@CucumberOptions(\n" +
-                "    features = \"src/test/resources/features\",\n" +
-                "    glue     = \"com.qa.stepdefs\",\n" +
-                "    tags     = \"" + firstTag + "\",\n" +
-                "    plugin   = {\"pretty\"}\n" +
-                ")\n" +
-                "public class " + className + "Runner {}\n";
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  UI ACTIONS INTERFACE  (static — referenced by PlaywrightMcpServer)
+    //  UI ACTIONS INTERFACE
     // ═════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Returns the source code for the UiActions interface.
-     * Framework-agnostic contract for all page interactions.
-     * Place at: src/main/java/com/qa/actions/UiActions.java
-     */
     public static String uiActionsInterface() {
         return "package com.qa.actions;\n\n" +
-                "import java.nio.file.Path;\n\n" +
                 "/**\n" +
-                " * UiActions — framework-agnostic interaction contract.\n" +
-                " *\n" +
-                " * Implementations:\n" +
-                " *   {@link PlaywrightUiActions}  — Playwright Java\n" +
-                " *   SeleniumUiActions             — Selenium WebDriver (future)\n" +
-                " *\n" +
-                " * Page Objects depend ONLY on this interface.\n" +
-                " * Swap the implementation in step @Before without touching any Page Object.\n" +
+                " * UiActions — abstraction over Playwright Locator API.\n" +
+                " * Implement with PlaywrightUiActions for production; mock for unit tests.\n" +
                 " */\n" +
                 "public interface UiActions {\n\n" +
-                "    /** Navigate to a URL and wait for load. */\n" +
-                "    void navigate(String url);\n\n" +
-                "    /** Click the element matching the given selector string. */\n" +
-                "    void click(String selector);\n\n" +
-                "    /** Double-click the element matching the given selector string. */\n" +
-                "    void doubleClick(String selector);\n\n" +
-                "    /** Clear and fill an input field. */\n" +
-                "    void fill(String selector, String value);\n\n" +
-                "    /** Type text character by character. */\n" +
-                "    void type(String selector, String text);\n\n" +
-                "    /** Clear an input field. */\n" +
-                "    void clear(String selector);\n\n" +
-                "    /** Press a key on a focused element or globally. */\n" +
-                "    void press(String selector, String key);\n\n" +
-                "    /** Hover over an element. */\n" +
-                "    void hover(String selector);\n\n" +
-                "    /** Select an option from a dropdown. */\n" +
-                "    void selectOption(String selector, String value);\n\n" +
-                "    /** Check a checkbox or radio button. */\n" +
-                "    void check(String selector);\n\n" +
-                "    /** Uncheck a checkbox. */\n" +
-                "    void uncheck(String selector);\n\n" +
-                "    /** Upload a file via a file input. */\n" +
-                "    void uploadFile(String selector, Path filePath);\n\n" +
-                "    /** Scroll the page by (deltaX, deltaY) pixels. */\n" +
-                "    void scroll(double deltaX, double deltaY);\n\n" +
-                "    /** Wait for an element to become visible. */\n" +
-                "    void waitForVisible(String selector);\n\n" +
-                "    /** Wait for an element to become hidden. */\n" +
-                "    void waitForHidden(String selector);\n\n" +
-                "    /** Wait for the page URL to match. */\n" +
-                "    void waitForUrl(String urlPattern);\n\n" +
-                "    /** Wait for network idle. */\n" +
-                "    void waitForNetworkIdle();\n\n" +
-                "    /** Take a screenshot and save to path. */\n" +
-                "    void screenshot(String filePath);\n\n" +
-                "    /** Get inner text of an element. */\n" +
-                "    String getText(String selector);\n\n" +
-                "    /** Get input value of a form field. */\n" +
-                "    String getValue(String selector);\n\n" +
-                "    /** Get an HTML attribute value. */\n" +
-                "    String getAttribute(String selector, String attribute);\n\n" +
-                "    /** Return true if the element is visible. */\n" +
-                "    boolean isVisible(String selector);\n\n" +
-                "    /** Return true if the element is enabled. */\n" +
-                "    boolean isEnabled(String selector);\n\n" +
-                "    /** Return true if the element is checked. */\n" +
-                "    boolean isChecked(String selector);\n\n" +
-                "    /** Return the current page URL. */\n" +
-                "    String getCurrentUrl();\n\n" +
-                "    /** Return the current page title. */\n" +
-                "    String getPageTitle();\n" +
+                "    void navigate(String url);\n" +
+                "    void click(String selector);\n" +
+                "    void fill(String selector, String value);\n" +
+                "    void pressSequentially(String selector, String text);\n" +
+                "    void press(String selector, String key);\n" +
+                "    void selectOption(String selector, String value);\n" +
+                "    void check(String selector);\n" +
+                "    void uncheck(String selector);\n" +
+                "    void hover(String selector);\n" +
+                "    void clear(String selector);\n" +
+                "    void uploadFile(String selector, String filePath);\n" +
+                "    void scroll(int deltaX, int deltaY);\n" +
+                "    String getText(String selector);\n" +
+                "    boolean isVisible(String selector);\n" +
+                "    void waitForSelector(String selector);\n" +
                 "}\n";
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    //  PLAYWRIGHT UI ACTIONS (generated implementation)
+    // ═════════════════════════════════════════════════════════════════════════
+
     /**
-     * Returns the source code for PlaywrightUiActions.
-     * Playwright implementation of the UiActions interface.
-     * Place at: src/main/java/com/qa/actions/PlaywrightUiActions.java
+     * Generates the PlaywrightUiActions implementation class.
+     *
+     * Audit fixes applied:
+     *   [TASK-2] navigate() uses DOMCONTENTLOADED + waitForSalesforceLightning().
+     *   [TASK-6] fill() uses scrollIntoViewIfNeeded + click + fill().
+     *   [TASK-6] pressSequentially() replaces deprecated type() — per-character key events.
+     *   [BG-3 FIX] WaitUntilState import added (was missing — caused compile error).
+     *   [BG-4 confirmed] TIMEOUT_MS comes from the generated class field, not PlaywrightMcpServer.
      */
     public static String playwrightUiActions() {
         return "package com.qa.actions;\n\n" +
                 "import com.microsoft.playwright.*;\n" +
                 "import com.microsoft.playwright.options.AriaRole;\n" +
-                "import com.microsoft.playwright.options.LoadState;\n" +
                 "import com.microsoft.playwright.options.WaitForSelectorState;\n" +
-                "import java.nio.file.Path;\n" +
+                // [BG-3 FIX] WaitUntilState required for DOMCONTENTLOADED in navigate()
+                "import com.microsoft.playwright.options.WaitUntilState;\n" +
                 "import java.nio.file.Paths;\n\n" +
                 "/**\n" +
-                " * PlaywrightUiActions — Playwright implementation of {@link UiActions}.\n" +
+                " * PlaywrightUiActions — UiActions implementation backed by a Playwright Page.\n" +
                 " *\n" +
-                " * Features:\n" +
-                " *  - Smart Wait: DOM ready → element visible → DOM settled before every action\n" +
-                " *  - Retry: up to 3 attempts with 500ms back-off\n" +
-                " *  - Locator resolution: role > placeholder > testId > label > css\n" +
+                " * navigate() strategy:\n" +
+                " *   Uses DOMCONTENTLOADED (not NETWORKIDLE) — safe for Salesforce Lightning.\n" +
+                " *   NETWORKIDLE deadlocks on SF orgs due to persistent WebSocket long-polling.\n" +
+                " *   waitForSalesforceLightning() handles Aura/LWC render stabilization.\n" +
+                " *\n" +
+                " * fill() strategy:\n" +
+                " *   scroll + click-to-focus + fill() for LWC/Aura shadow-DOM inputs.\n" +
+                " *\n" +
+                " * press() null-selector routing:\n" +
+                " *   null/blank selector → page.keyboard().press(key) (global keypress).\n" +
+                " *   non-blank selector  → locator.press(key) (element-scoped).\n" +
                 " */\n" +
                 "public class PlaywrightUiActions implements UiActions {\n\n" +
-                "    private static final long   TIMEOUT_MS   = Long.parseLong(\n" +
+                "    private static final long TIMEOUT_MS = Long.parseLong(\n" +
                 "            System.getenv().getOrDefault(\"MCP_TIMEOUT_MS\", \"30000\"));\n" +
-                "    private static final int    RETRY_MAX    = Integer.parseInt(\n" +
+                "    private static final long SF_TIMEOUT = Long.parseLong(\n" +
+                "            System.getenv().getOrDefault(\"MCP_SF_ELEMENT_TIMEOUT_MS\", \"30000\"));\n" +
+                "    private static final long LIGHTNING_TIMEOUT = Long.parseLong(\n" +
+                "            System.getenv().getOrDefault(\"MCP_SF_LIGHTNING_TIMEOUT_MS\", \"20000\"));\n" +
+                "    private static final long LWC_BUFFER_MS = Long.parseLong(\n" +
+                "            System.getenv().getOrDefault(\"MCP_LWC_BUFFER_MS\", \"1000\"));\n" +
+                "    private static final long TYPE_KEY_DELAY_MS = Long.parseLong(\n" +
+                "            System.getenv().getOrDefault(\"MCP_TYPE_KEY_DELAY_MS\", \"50\"));\n" +
+                "    private static final int RETRY_MAX = Integer.parseInt(\n" +
                 "            System.getenv().getOrDefault(\"MCP_RETRY_MAX\", \"3\"));\n" +
-                "    private static final long   RETRY_DELAY  = 500L;\n\n" +
+                "    private static final long RETRY_DELAY_MS = Long.parseLong(\n" +
+                "            System.getenv().getOrDefault(\"MCP_RETRY_DELAY_MS\", \"800\"));\n\n" +
                 "    private final Page page;\n\n" +
                 "    public PlaywrightUiActions(Page page) {\n" +
                 "        this.page = page;\n" +
                 "    }\n\n" +
-                "    // ── Navigation ────────────────────────────────────────────────────\n\n" +
+                // [TASK-2] DOMCONTENTLOADED + waitForSalesforceLightning
                 "    @Override\n" +
                 "    public void navigate(String url) {\n" +
-                "        retry(() -> page.navigate(url));\n" +
-                "        page.waitForLoadState(LoadState.LOAD);\n" +
-                "        silently(() -> page.waitForLoadState(LoadState.NETWORKIDLE,\n" +
-                "                new Page.WaitForLoadStateOptions().setTimeout(5000)));\n" +
+                "        retry(() -> page.navigate(url,\n" +
+                "                new Page.NavigateOptions()\n" +
+                "                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)\n" +
+                "                        .setTimeout(TIMEOUT_MS)));\n" +
+                "        waitForSalesforceLightning();\n" +
                 "    }\n\n" +
-                "    // ── Interactions ──────────────────────────────────────────────────\n\n" +
                 "    @Override\n" +
                 "    public void click(String selector) {\n" +
-                "        smartWait(selector, \"CLICK\");\n" +
-                "        retry(() -> resolve(selector).click(\n" +
-                "                new Locator.ClickOptions().setTimeout(TIMEOUT_MS)));\n" +
-                "        silently(() -> page.waitForLoadState(LoadState.LOAD,\n" +
-                "                new Page.WaitForLoadStateOptions().setTimeout(5000)));\n" +
+                "        retry(() -> resolve(selector).first()\n" +
+                "                .click(new Locator.ClickOptions().setTimeout(SF_TIMEOUT)));\n" +
                 "    }\n\n" +
-                "    @Override\n" +
-                "    public void doubleClick(String selector) {\n" +
-                "        smartWait(selector, \"CLICK\");\n" +
-                "        retry(() -> resolve(selector).dblclick());\n" +
-                "    }\n\n" +
+                // [TASK-6] fill: scroll + click-to-focus + fill()
                 "    @Override\n" +
                 "    public void fill(String selector, String value) {\n" +
-                "        smartWait(selector, \"FILL\");\n" +
-                "        retry(() -> { resolve(selector).clear(); resolve(selector).fill(value); });\n" +
+                "        retry(() -> {\n" +
+                "            Locator loc = resolve(selector).first();\n" +
+                "            loc.scrollIntoViewIfNeeded();\n" +
+                "            loc.click();\n" +
+                "            loc.fill(value);\n" +
+                "        });\n" +
                 "    }\n\n" +
+                // [TASK-6] pressSequentially: per-character key events with configurable delay
                 "    @Override\n" +
-                "    public void type(String selector, String text) {\n" +
-                "        smartWait(selector, \"FILL\");\n" +
-                "        retry(() -> resolve(selector).type(text));\n" +
+                "    public void pressSequentially(String selector, String text) {\n" +
+                "        retry(() -> resolve(selector).pressSequentially(text,\n" +
+                "                new Locator.PressSequentiallyOptions()\n" +
+                "                        .setDelay((double) TYPE_KEY_DELAY_MS)));\n" +
                 "    }\n\n" +
-                "    @Override\n" +
-                "    public void clear(String selector) {\n" +
-                "        smartWait(selector, \"FILL\");\n" +
-                "        retry(() -> resolve(selector).clear());\n" +
-                "    }\n\n" +
+                // [TASK-3] null/blank selector → global keyboard press; else element press
                 "    @Override\n" +
                 "    public void press(String selector, String key) {\n" +
-                "        if (selector == null || selector.isBlank()) page.keyboard().press(key);\n" +
-                "        else resolve(selector).press(key);\n" +
-                "    }\n\n" +
-                "    @Override\n" +
-                "    public void hover(String selector) {\n" +
-                "        smartWait(selector, \"CLICK\");\n" +
-                "        retry(() -> resolve(selector).hover());\n" +
+                "        if (selector == null || selector.isBlank()) {\n" +
+                "            page.keyboard().press(key);\n" +
+                "        } else {\n" +
+                "            retry(() -> resolve(selector).press(key));\n" +
+                "        }\n" +
                 "    }\n\n" +
                 "    @Override\n" +
                 "    public void selectOption(String selector, String value) {\n" +
-                "        smartWait(selector, \"FILL\");\n" +
                 "        retry(() -> resolve(selector).selectOption(value));\n" +
                 "    }\n\n" +
                 "    @Override\n" +
                 "    public void check(String selector) {\n" +
-                "        smartWait(selector, \"CLICK\");\n" +
                 "        retry(() -> resolve(selector).check());\n" +
                 "    }\n\n" +
                 "    @Override\n" +
                 "    public void uncheck(String selector) {\n" +
-                "        smartWait(selector, \"CLICK\");\n" +
                 "        retry(() -> resolve(selector).uncheck());\n" +
                 "    }\n\n" +
                 "    @Override\n" +
-                "    public void uploadFile(String selector, Path filePath) {\n" +
-                "        resolve(selector).setInputFiles(filePath);\n" +
+                "    public void hover(String selector) {\n" +
+                "        retry(() -> resolve(selector).hover());\n" +
                 "    }\n\n" +
                 "    @Override\n" +
-                "    public void scroll(double deltaX, double deltaY) {\n" +
+                "    public void clear(String selector) {\n" +
+                "        retry(() -> resolve(selector).clear());\n" +
+                "    }\n\n" +
+                "    @Override\n" +
+                "    public void uploadFile(String selector, String filePath) {\n" +
+                "        resolve(selector).setInputFiles(Paths.get(filePath));\n" +
+                "    }\n\n" +
+                "    @Override\n" +
+                "    public void scroll(int deltaX, int deltaY) {\n" +
                 "        page.mouse().wheel(deltaX, deltaY);\n" +
                 "    }\n\n" +
-                "    // ── Waits ─────────────────────────────────────────────────────────\n\n" +
                 "    @Override\n" +
-                "    public void waitForVisible(String selector) {\n" +
-                "        page.waitForSelector(toBareCss(selector),\n" +
+                "    public String getText(String selector) {\n" +
+                "        return resolve(selector).first().innerText();\n" +
+                "    }\n\n" +
+                "    @Override\n" +
+                "    public boolean isVisible(String selector) {\n" +
+                "        return resolve(selector).first().isVisible();\n" +
+                "    }\n\n" +
+                "    @Override\n" +
+                "    public void waitForSelector(String selector) {\n" +
+                "        page.waitForSelector(selector,\n" +
                 "                new Page.WaitForSelectorOptions()\n" +
                 "                        .setState(WaitForSelectorState.VISIBLE)\n" +
-                "                        .setTimeout(TIMEOUT_MS));\n" +
-                "    }\n\n" +
-                "    @Override\n" +
-                "    public void waitForHidden(String selector) {\n" +
-                "        page.waitForSelector(toBareCss(selector),\n" +
-                "                new Page.WaitForSelectorOptions()\n" +
-                "                        .setState(WaitForSelectorState.HIDDEN)\n" +
-                "                        .setTimeout(TIMEOUT_MS));\n" +
-                "    }\n\n" +
-                "    @Override\n" +
-                "    public void waitForUrl(String urlPattern) {\n" +
-                "        page.waitForURL(urlPattern, new Page.WaitForURLOptions().setTimeout(TIMEOUT_MS));\n" +
-                "    }\n\n" +
-                "    @Override\n" +
-                "    public void waitForNetworkIdle() {\n" +
-                "        page.waitForLoadState(LoadState.NETWORKIDLE,\n" +
-                "                new Page.WaitForLoadStateOptions().setTimeout(TIMEOUT_MS));\n" +
-                "    }\n\n" +
-                "    // ── Screenshot ────────────────────────────────────────────────────\n\n" +
-                "    @Override\n" +
-                "    public void screenshot(String filePath) {\n" +
-                "        page.screenshot(new Page.ScreenshotOptions()\n" +
-                "                .setPath(Paths.get(filePath)).setFullPage(true));\n" +
-                "    }\n\n" +
-                "    // ── Inspection ────────────────────────────────────────────────────\n\n" +
-                "    @Override public String  getText(String s)                     { return resolve(s).first().innerText(); }\n" +
-                "    @Override public String  getValue(String s)                    { return resolve(s).first().inputValue(); }\n" +
-                "    @Override public String  getAttribute(String s, String attr)   { return resolve(s).first().getAttribute(attr); }\n" +
-                "    @Override public boolean isVisible(String s)                   { return resolve(s).first().isVisible(); }\n" +
-                "    @Override public boolean isEnabled(String s)                   { return resolve(s).first().isEnabled(); }\n" +
-                "    @Override public boolean isChecked(String s)                   { return resolve(s).first().isChecked(); }\n" +
-                "    @Override public String  getCurrentUrl()                       { return page.url(); }\n" +
-                "    @Override public String  getPageTitle()                        { return page.title(); }\n\n" +
-                "    // ── Smart Wait ────────────────────────────────────────────────────\n\n" +
-                "    private void smartWait(String selector, String actionType) {\n" +
-                "        // 1. DOM ready\n" +
-                "        silently(() -> page.waitForFunction(\n" +
-                "                \"document.readyState === 'complete'\",\n" +
-                "                new Page.WaitForFunctionOptions().setTimeout(TIMEOUT_MS)));\n" +
-                "        if (selector == null || selector.isBlank()) return;\n" +
-                "        // 2. Element visible\n" +
-                "        String css = toBareCss(selector);\n" +
-                "        silently(() -> page.waitForSelector(css,\n" +
-                "                new Page.WaitForSelectorOptions()\n" +
-                "                        .setState(WaitForSelectorState.VISIBLE)\n" +
-                "                        .setTimeout(TIMEOUT_MS)));\n" +
-                "        // 3. Element enabled (for inputs)\n" +
-                "        if (\"FILL\".equals(actionType)) {\n" +
-                "            silently(() -> page.waitForFunction(\n" +
-                "                    \"sel => { const el = document.querySelector(sel); return el && !el.disabled; }\",\n" +
-                "                    css, new Page.WaitForFunctionOptions().setTimeout(TIMEOUT_MS)));\n" +
-                "        }\n" +
+                "                        .setTimeout(SF_TIMEOUT));\n" +
                 "    }\n\n" +
                 "    // ── Locator resolution ────────────────────────────────────────────\n\n" +
                 "    private Locator resolve(String raw) {\n" +
@@ -665,399 +605,407 @@ public class BddCodeGenerator {
                 "        if (sel.startsWith(\"role:\")) {\n" +
                 "            String[] p = sel.substring(5).split(\":\", 2);\n" +
                 "            try {\n" +
-                "                AriaRole r = AriaRole.valueOf(p[0].toUpperCase().replace(\"-\",\"_\").replace(\" \",\"_\"));\n" +
+                "                AriaRole r = AriaRole.valueOf(\n" +
+                "                        p[0].toUpperCase().replace(\"-\",\"_\").replace(\" \",\"_\"));\n" +
                 "                return p.length > 1 && !p[1].isBlank()\n" +
                 "                        ? page.getByRole(r, new Page.GetByRoleOptions().setName(p[1]))\n" +
                 "                        : page.getByRole(r);\n" +
-                "            } catch (IllegalArgumentException e) { return page.locator(\"[role='\" + p[0] + \"']\"); }\n" +
+                "            } catch (IllegalArgumentException e) {\n" +
+                "                return page.locator(\"[role='\" + p[0] + \"']\");\n" +
+                "            }\n" +
                 "        }\n" +
-                "        if (sel.startsWith(\"placeholder:\")) return page.getByPlaceholder(sel.substring(12));\n" +
-                "        if (sel.startsWith(\"testid:\"))      return page.getByTestId(sel.substring(7));\n" +
-                "        if (sel.startsWith(\"label:\"))       return page.getByLabel(sel.substring(6));\n" +
                 "        if (sel.startsWith(\"text:\"))        return page.getByText(sel.substring(5),\n" +
-                "                                                    new Page.GetByTextOptions().setExact(false));\n" +
+                "                new Page.GetByTextOptions().setExact(false));\n" +
+                "        if (sel.startsWith(\"placeholder:\")) return page.getByPlaceholder(sel.substring(12));\n" +
+                "        if (sel.startsWith(\"label:\"))       return page.getByLabel(sel.substring(6));\n" +
+                "        if (sel.startsWith(\"testid:\"))      return page.getByTestId(sel.substring(7));\n" +
                 "        if (sel.startsWith(\"xpath:\"))       return page.locator(\"xpath=\" + sel.substring(6));\n" +
                 "        return page.locator(sel);\n" +
                 "    }\n\n" +
-                "    private static String toBareCss(String sel) {\n" +
-                "        if (sel == null) return \"body\";\n" +
-                "        sel = sel.replaceAll(\"::nth=\\\\d+$\", \"\").trim();\n" +
-                "        if (sel.startsWith(\"placeholder:\")) return \"[placeholder=\\\"\" + sel.substring(12) + \"\\\"]\";\n" +
-                "        if (sel.startsWith(\"testid:\"))      return \"[data-testid=\\\"\" + sel.substring(7) + \"\\\"]\";\n" +
-                "        if (sel.startsWith(\"role:\") || sel.startsWith(\"text:\") ||\n" +
-                "            sel.startsWith(\"xpath:\") || sel.startsWith(\"label:\")) return \"body\";\n" +
-                "        return sel;\n" +
-                "    }\n\n" +
-                "    // ── Retry ─────────────────────────────────────────────────────────\n\n" +
-                "    @FunctionalInterface interface Action { void run() throws Exception; }\n\n" +
+                "    // ── Retry engine ──────────────────────────────────────────────────\n\n" +
+                "    @FunctionalInterface\n" +
+                "    private interface Action { void run() throws Exception; }\n\n" +
                 "    private void retry(Action action) {\n" +
                 "        Exception last = null;\n" +
-                "        for (int i = 0; i <= RETRY_MAX; i++) {\n" +
-                "            try { action.run(); return; } catch (Exception e) {\n" +
+                "        for (int attempt = 0; attempt <= RETRY_MAX; attempt++) {\n" +
+                "            try { action.run(); return; }\n" +
+                "            catch (Exception e) {\n" +
                 "                last = e;\n" +
-                "                if (i < RETRY_MAX) {\n" +
-                "                    try { Thread.sleep(RETRY_DELAY); } catch (InterruptedException ie) {\n" +
-                "                        Thread.currentThread().interrupt(); throw new RuntimeException(ie); }\n" +
+                "                if (attempt < RETRY_MAX) {\n" +
+                "                    try { Thread.sleep(RETRY_DELAY_MS); }\n" +
+                "                    catch (InterruptedException ie) {\n" +
+                "                        Thread.currentThread().interrupt();\n" +
+                "                        throw new RuntimeException(ie);\n" +
+                "                    }\n" +
                 "                }\n" +
                 "            }\n" +
                 "        }\n" +
-                "        throw new RuntimeException(\"Action failed after \" + (RETRY_MAX + 1) + \" attempts\", last);\n" +
+                "        throw new RuntimeException(\"Action failed after \" + RETRY_MAX + \" retries\", last);\n" +
                 "    }\n\n" +
-                "    private void silently(Action action) {\n" +
-                "        try { action.run(); } catch (Exception ignored) {}\n" +
+                "    // ── Salesforce Lightning stabilization ────────────────────────────\n\n" +
+                "    /**\n" +
+                "     * Waits for Salesforce Lightning / LWC to finish rendering.\n" +
+                "     * Non-Salesforce pages return immediately at step 1 (one-app absent).\n" +
+                "     *\n" +
+                "     * Step 1 — one-app bootstrap marker present.\n" +
+                "     * Step 2 — at least one Aura-rendered component visible.\n" +
+                "     * Step 3 — all SLDS spinners dismissed.\n" +
+                "     * Step 4 — LWC_BUFFER_MS micro-task buffer for async render queue.\n" +
+                "     */\n" +
+                "    private void waitForSalesforceLightning() {\n" +
+                "        try {\n" +
+                "            page.waitForSelector(\"one-app\",\n" +
+                "                    new Page.WaitForSelectorOptions()\n" +
+                "                            .setState(WaitForSelectorState.ATTACHED)\n" +
+                "                            .setTimeout(LIGHTNING_TIMEOUT));\n" +
+                "        } catch (Exception ignored) {\n" +
+                "            return; // Not a Salesforce page — exit immediately\n" +
+                "        }\n" +
+                "        try {\n" +
+                "            page.waitForSelector(\"[data-aura-rendered-by]\",\n" +
+                "                    new Page.WaitForSelectorOptions()\n" +
+                "                            .setState(WaitForSelectorState.VISIBLE)\n" +
+                "                            .setTimeout(LIGHTNING_TIMEOUT));\n" +
+                "        } catch (Exception ignored) {}\n" +
+                "        try {\n" +
+                "            page.waitForFunction(\n" +
+                "                    \"() => document.querySelectorAll('.slds-spinner').length === 0\",\n" +
+                "                    new Page.WaitForFunctionOptions().setTimeout(LIGHTNING_TIMEOUT));\n" +
+                "        } catch (Exception ignored) {}\n" +
+                "        try { page.waitForTimeout(LWC_BUFFER_MS); } catch (Exception ignored) {}\n" +
                 "    }\n" +
                 "}\n";
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    //  SCENARIO CONTEXT
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Returns the source code for ScenarioContext.
+     *
+     * Shared state carrier injected by Cucumber PicoContainer into every step class.
+     * Generate once — do not regenerate per feature.
+     * Path: src/test/java/com/qa/context/ScenarioContext.java
+     *
+     * Design decisions:
+     *   - setPage() wires uiActions automatically — Hooks.java only needs one call.
+     *   - reset() nulls handles rather than discarding the instance — safe for
+     *     TestNG parallel reuse across scenarios in the same JVM.
+     *   - testData uses synchronized LinkedHashMap — preserves insertion order for
+     *     @After logging while remaining safe under parallel step execution.
+     */
+    public static String scenarioContext() {
+        return "package com.qa.context;\n\n" +
+                "import com.microsoft.playwright.Page;\n" +
+                "import com.qa.actions.UiActions;\n" +
+                "import com.qa.actions.PlaywrightUiActions;\n\n" +
+                "import java.util.Collections;\n" +
+                "import java.util.LinkedHashMap;\n" +
+                "import java.util.Map;\n\n" +
+                "/**\n" +
+                " * ScenarioContext — shared state carrier for a single Cucumber scenario.\n" +
+                " *\n" +
+                " * Lifecycle:\n" +
+                " *   Created once per scenario by PicoContainer.\n" +
+                " *   Injected into every step class that declares it as a constructor parameter.\n" +
+                " *   Destroyed (state cleared) after the scenario completes via Hooks.java @After.\n" +
+                " *\n" +
+                " * Usage in a step class:\n" +
+                " * <pre>\n" +
+                " *   public class MySteps {\n" +
+                " *       private final ScenarioContext context;\n" +
+                " *       public MySteps(ScenarioContext context) { this.context = context; }\n" +
+                " *   }\n" +
+                " * </pre>\n" +
+                " */\n" +
+                "public class ScenarioContext {\n\n" +
+                "    // ── Core Playwright handles ───────────────────────────────────────\n\n" +
+                "    private Page      page;\n" +
+                "    private UiActions uiActions;\n\n" +
+                "    // ── Shared test data (scenario-scoped key/value store) ────────────\n\n" +
+                "    private final Map<String, String> testData =\n" +
+                "            Collections.synchronizedMap(new LinkedHashMap<>());\n\n" +
+                "    // ── Page ─────────────────────────────────────────────────────────\n\n" +
+                "    /**\n" +
+                "     * Returns the Playwright Page for the current scenario.\n" +
+                "     * Set by Hooks.java @Before — always non-null when a step runs.\n" +
+                "     */\n" +
+                "    public Page getPage() {\n" +
+                "        if (page == null) throw new IllegalStateException(\n" +
+                "                \"ScenarioContext.page is null — \"\n" +
+                "                + \"ensure Hooks.java @Before sets it before the first step.\");\n" +
+                "        return page;\n" +
+                "    }\n\n" +
+                "    /**\n" +
+                "     * Called by Hooks.java @Before to bind the scenario's Page.\n" +
+                "     * Automatically wires a new PlaywrightUiActions instance.\n" +
+                "     */\n" +
+                "    public void setPage(Page page) {\n" +
+                "        this.page      = page;\n" +
+                "        this.uiActions = new PlaywrightUiActions(page);\n" +
+                "    }\n\n" +
+                "    // ── UiActions ────────────────────────────────────────────────────\n\n" +
+                "    /**\n" +
+                "     * Returns the UiActions implementation for the current scenario.\n" +
+                "     * Automatically wired to the Page when setPage() is called.\n" +
+                "     */\n" +
+                "    public UiActions getUiActions() {\n" +
+                "        if (uiActions == null) throw new IllegalStateException(\n" +
+                "                \"ScenarioContext.uiActions is null — \"\n" +
+                "                + \"ensure Hooks.java @Before calls setPage() first.\");\n" +
+                "        return uiActions;\n" +
+                "    }\n\n" +
+                "    /**\n" +
+                "     * Override the UiActions implementation (e.g. for mocking in unit tests).\n" +
+                "     * Normal usage does not need to call this — setPage() wires it automatically.\n" +
+                "     */\n" +
+                "    public void setUiActions(UiActions uiActions) {\n" +
+                "        this.uiActions = uiActions;\n" +
+                "    }\n\n" +
+                "    // ── Shared test data ─────────────────────────────────────────────\n\n" +
+                "    /**\n" +
+                "     * Store a value for the duration of the current scenario.\n" +
+                "     * Use to pass data between steps (e.g. a generated ID from step 1 to step 3).\n" +
+                "     */\n" +
+                "    public void set(String key, String value) {\n" +
+                "        testData.put(key, value);\n" +
+                "    }\n\n" +
+                "    /** Retrieve a value stored earlier in this scenario. Returns null if absent. */\n" +
+                "    public String get(String key) {\n" +
+                "        return testData.get(key);\n" +
+                "    }\n\n" +
+                "    /** Retrieve a value with a fallback default. */\n" +
+                "    public String get(String key, String defaultValue) {\n" +
+                "        return testData.getOrDefault(key, defaultValue);\n" +
+                "    }\n\n" +
+                "    /** Returns true if a value has been stored under the given key. */\n" +
+                "    public boolean has(String key) {\n" +
+                "        return testData.containsKey(key);\n" +
+                "    }\n\n" +
+                "    /**\n" +
+                "     * Returns an unmodifiable snapshot of all test data.\n" +
+                "     * Useful for debugging or Allure attachment in @After hooks.\n" +
+                "     */\n" +
+                "    public Map<String, String> getAllTestData() {\n" +
+                "        return Collections.unmodifiableMap(testData);\n" +
+                "    }\n\n" +
+                "    // ── Lifecycle ────────────────────────────────────────────────────\n\n" +
+                "    /**\n" +
+                "     * Clears all scenario state.\n" +
+                "     * Called by Hooks.java @After so PicoContainer can safely reuse this instance\n" +
+                "     * across scenarios in the same JVM (parallel TestNG runs).\n" +
+                "     */\n" +
+                "    public void reset() {\n" +
+                "        page      = null;\n" +
+                "        uiActions = null;\n" +
+                "        testData.clear();\n" +
+                "    }\n" +
+                "}\n";
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  RUNNERS
+    // ═════════════════════════════════════════════════════════════════════════
+
+    public String runnerClass() {
+        String className = toPascal(featureName);
+        return switch (framework) {
+            case "testng"   -> testngRunner(className);
+            case "serenity" -> serenityRunner(className);
+            default         -> cucumberRunner(className);
+        };
+    }
+
+    private String cucumberRunner(String className) {
+        return "package com.qa.runners;\n\n" +
+                "import org.junit.platform.suite.api.*;\n\n" +
+                "@Suite\n" +
+                "@IncludeEngines(\"cucumber\")\n" +
+                "@SelectClasspathResource(\"features\")\n" +
+                "@ConfigurationParameter(key = \"cucumber.plugin\",\n" +
+                "        value = \"pretty, io.qameta.allure.cucumber7jvm.AllureCucumber7Jvm\")\n" +
+                "@ConfigurationParameter(key = \"cucumber.glue\", value = \"com.qa.stepdefs\")\n" +
+                "@ConfigurationParameter(key = \"cucumber.filter.tags\", value = \"" + tags + "\")\n" +
+                "public class " + className + "Runner {}\n";
+    }
+
+    private String testngRunner(String className) {
+        return "package com.qa.runners;\n\n" +
+                "import io.cucumber.testng.AbstractTestNGCucumberTests;\n" +
+                "import io.cucumber.testng.CucumberOptions;\n" +
+                "import org.testng.annotations.DataProvider;\n\n" +
+                "@CucumberOptions(\n" +
+                "        features = \"src/test/resources/features\",\n" +
+                "        glue     = \"com.qa.stepdefs\",\n" +
+                "        tags     = \"" + tags + "\",\n" +
+                "        plugin   = {\"pretty\",\n" +
+                "                    \"io.qameta.allure.cucumber7jvm.AllureCucumber7Jvm\"})\n" +
+                "public class " + className + "Runner extends AbstractTestNGCucumberTests {\n" +
+                "    @Override\n" +
+                "    @DataProvider(parallel = true)\n" +
+                "    public Object[][] scenarios() { return super.scenarios(); }\n" +
+                "}\n";
+    }
+
+    private String serenityRunner(String className) {
+        return "package com.qa.runners;\n\n" +
+                "import io.cucumber.junit.CucumberOptions;\n" +
+                "import net.serenitybdd.cucumber.CucumberWithSerenity;\n" +
+                "import org.junit.runner.RunWith;\n\n" +
+                "@RunWith(CucumberWithSerenity.class)\n" +
+                "@CucumberOptions(\n" +
+                "        features = \"src/test/resources/features\",\n" +
+                "        glue     = \"com.qa.stepdefs\",\n" +
+                "        tags     = \"" + tags + "\",\n" +
+                "        plugin   = {\"pretty\"})\n" +
+                "public class " + className + "Runner {}\n";
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     //  POM.XML
     // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Generates the project pom.xml.
+     *
+     * [BG-5 FIX] cucumber-picocontainer added — required for ScenarioContext
+     * constructor injection. Without it, PicoContainer cannot satisfy the
+     * ScenarioContext parameter in step class constructors.
+     */
     public static String pomXml() {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
                 "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n" +
                 "         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n" +
-                "         xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd\">\n" +
+                "         xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0\n" +
+                "         http://maven.apache.org/xsd/maven-4.0.0.xsd\">\n" +
                 "  <modelVersion>4.0.0</modelVersion>\n" +
                 "  <groupId>com.qa</groupId>\n" +
-                "  <artifactId>playwright-bdd-framework</artifactId>\n" +
+                "  <artifactId>playwright-mcp-bdd</artifactId>\n" +
                 "  <version>1.0.0</version>\n" +
+                "  <packaging>jar</packaging>\n\n" +
                 "  <properties>\n" +
-                "    <java.version>17</java.version>\n" +
                 "    <maven.compiler.source>17</maven.compiler.source>\n" +
                 "    <maven.compiler.target>17</maven.compiler.target>\n" +
+                "    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>\n" +
+                "    <!-- Update playwright.version when upgrading -->\n" +
                 "    <playwright.version>1.44.0</playwright.version>\n" +
-                "    <cucumber.version>7.18.0</cucumber.version>\n" +
-                "    <allure.version>2.27.0</allure.version>\n" +
-                "  </properties>\n" +
-                "  <dependencies>\n" +
+                "    <cucumber.version>7.15.0</cucumber.version>\n" +
+                "    <junit5.version>5.10.2</junit5.version>\n" +
+                "    <allure.version>2.25.0</allure.version>\n" +
+                "    <testng.version>7.9.0</testng.version>\n" +
+                "  </properties>\n\n" +
+                "  <dependencies>\n\n" +
+                "    <!-- Playwright -->\n" +
                 "    <dependency><groupId>com.microsoft.playwright</groupId><artifactId>playwright</artifactId>\n" +
-                "      <version>${playwright.version}</version></dependency>\n" +
+                "      <version>${playwright.version}</version></dependency>\n\n" +
+                "    <!-- Cucumber -->\n" +
                 "    <dependency><groupId>io.cucumber</groupId><artifactId>cucumber-java</artifactId>\n" +
                 "      <version>${cucumber.version}</version><scope>test</scope></dependency>\n" +
                 "    <dependency><groupId>io.cucumber</groupId><artifactId>cucumber-junit-platform-engine</artifactId>\n" +
                 "      <version>${cucumber.version}</version><scope>test</scope></dependency>\n" +
-                "    <dependency><groupId>io.cucumber</groupId><artifactId>cucumber-testng</artifactId>\n" +
-                "      <version>${cucumber.version}</version><scope>test</scope></dependency>\n" +
-                "    <dependency><groupId>org.junit.platform</groupId><artifactId>junit-platform-suite</artifactId>\n" +
-                "      <version>1.10.2</version><scope>test</scope></dependency>\n" +
+                // [BG-5 FIX] cucumber-picocontainer — required for ScenarioContext DI
+                "    <dependency><groupId>io.cucumber</groupId><artifactId>cucumber-picocontainer</artifactId>\n" +
+                "      <version>${cucumber.version}</version><scope>test</scope></dependency>\n\n" +
+                "    <!-- JUnit 5 -->\n" +
                 "    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId>\n" +
-                "      <version>5.10.2</version><scope>test</scope></dependency>\n" +
-                "    <dependency><groupId>org.testng</groupId><artifactId>testng</artifactId>\n" +
-                "      <version>7.9.0</version><scope>test</scope></dependency>\n" +
+                "      <version>${junit5.version}</version><scope>test</scope></dependency>\n" +
+                "    <dependency><groupId>org.junit.platform</groupId><artifactId>junit-platform-suite</artifactId>\n" +
+                "      <version>1.10.2</version><scope>test</scope></dependency>\n\n" +
+                "    <!-- Allure -->\n" +
                 "    <dependency><groupId>io.qameta.allure</groupId><artifactId>allure-cucumber7-jvm</artifactId>\n" +
-                "      <version>${allure.version}</version><scope>test</scope></dependency>\n" +
-                "    <dependency><groupId>io.qameta.allure</groupId><artifactId>allure-testng</artifactId>\n" +
-                "      <version>${allure.version}</version><scope>test</scope></dependency>\n" +
-                "  </dependencies>\n" +
-                "  <build><plugins>\n" +
-                "    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId>\n" +
-                "      <version>3.2.5</version>\n" +
-                "      <configuration><systemPropertyVariables>\n" +
-                "        <allure.results.directory>target/allure-results</allure.results.directory>\n" +
-                "      </systemPropertyVariables></configuration>\n" +
-                "    </plugin>\n" +
-                "  </plugins></build>\n" +
+                "      <version>${allure.version}</version><scope>test</scope></dependency>\n\n" +
+                "    <!-- TestNG (optional — only required for testng runner) -->\n" +
+                "    <dependency><groupId>org.testng</groupId><artifactId>testng</artifactId>\n" +
+                "      <version>${testng.version}</version><scope>test</scope></dependency>\n" +
+                "    <dependency><groupId>io.cucumber</groupId><artifactId>cucumber-testng</artifactId>\n" +
+                "      <version>${cucumber.version}</version><scope>test</scope></dependency>\n\n" +
+                "    <!-- Jackson -->\n" +
+                "    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId>\n" +
+                "      <version>2.17.0</version></dependency>\n\n" +
+                "  </dependencies>\n\n" +
+                "  <build>\n" +
+                "    <plugins>\n" +
+                "      <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId>\n" +
+                "        <version>3.2.5</version>\n" +
+                "        <configuration>\n" +
+                "          <includes><include>**/*Runner.java</include></includes>\n" +
+                "        </configuration>\n" +
+                "      </plugin>\n" +
+                "      <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId>\n" +
+                "        <version>3.5.2</version>\n" +
+                "        <executions><execution><phase>package</phase><goals><goal>shade</goal></goals>\n" +
+                "          <configuration>\n" +
+                "            <filters><filter><artifact>*:*</artifact>\n" +
+                "              <excludes><exclude>META-INF/*.SF</exclude><exclude>META-INF/*.DSA</exclude><exclude>META-INF/*.RSA</exclude></excludes>\n" +
+                "            </filter></filters>\n" +
+                "            <transformers>\n" +
+                "              <transformer implementation=\"org.apache.maven.plugins.shade.resource.ServicesResourceTransformer\"/>\n" +
+                "              <transformer implementation=\"org.apache.maven.plugins.shade.resource.ManifestResourceTransformer\">\n" +
+                "                <mainClass>com.qa.mcp.PlaywrightMcpServer</mainClass>\n" +
+                "              </transformer>\n" +
+                "            </transformers>\n" +
+                "          </configuration>\n" +
+                "        </execution></executions>\n" +
+                "      </plugin>\n" +
+                "    </plugins>\n" +
+                "  </build>\n" +
                 "</project>\n";
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  PRIVATE BUILDERS
+    //  UTILITIES
     // ═════════════════════════════════════════════════════════════════════════
 
-    /** Build field registry from raw events — called once in constructor.
-     *  Stores the raw selector string (CSS/href/role prefix) as the locator constant value.
-     *  This matches the ParabankAccountOpeningPage pattern: private final String FIELD = "css...";
-     */
-    private void buildFieldRegistry() {
-        if (rawEvents == null) return;
-        for (JsonNode e : rawEvents) {
-            String at = e.path("actionType").asText();
-            if (Set.of("FOCUS","NAVIGATE","SCROLL","HOVER").contains(at)) continue;
-            JsonNode loc = e.path("locator");
-            if (loc.isMissingNode() || loc.isNull()) continue;
-            String fname = toFieldName(e);
-            if (fname == null || fields.containsKey(fname)) continue;
-            // Store the raw selector string (matching ParabankAccountOpeningPage pattern)
-            String selectorStr = rawSelectorString(loc);
-            String constantName = toConstantName(fname);
-            fields.put(fname, new FieldEntry(selectorStr, at, e.path("inputValue").asText(""), constantName));
-        }
-    }
-
-    /** Convert a locator node to a raw selector string suitable for a String constant.
-     *  Prefers: href > cssSelector > id > xpath.
-     *  This is used as the VALUE of the String constant in the Page Object.
-     */
-    private static String rawSelectorString(JsonNode loc) {
-        String strategy = loc.path("strategy").asText("css");
-        return switch (strategy) {
-            case "href"    -> "a[href=\"" + loc.path("href").asText("") + "\"]";
-            case "css-id"  -> loc.path("cssSelector").asText(loc.path("primary").asText(""));
-            case "testId"  -> "[data-testid=\"" + loc.path("testId").asText() + "\"]";
-            case "role"    -> loc.path("cssSelector").asText(loc.path("primary").asText(""));
-            case "placeholder" -> "[placeholder=\"" + loc.path("placeholder").asText() + "\"]";
-            default        -> loc.path("cssSelector").asText(loc.path("primary").asText("body"));
-        };
-    }
-
-    /** Convert a camelCase field name to UPPER_SNAKE_CASE constant name. */
-    private static String toConstantName(String camel) {
-        if (camel == null || camel.isBlank()) return "ELEMENT";
-        // Insert underscore before each uppercase letter, then uppercase everything
-        return camel.replaceAll("([A-Z])", "_$1").toUpperCase().replaceAll("^_", "");
-    }
-
-    private String buildActionMethod(String fname, FieldEntry fe) {
-        // Use UPPER_SNAKE_CASE constant name (e.g. USERNAME_FIELD) in the method body
-        String constName = fe.constantName != null ? fe.constantName : toConstantName(fname);
-        String jd = "    /**\n     * Perform " + fe.actionType.toLowerCase().replace("_"," ")
-                + " on the '" + fname + "' element.\n";
-        return switch (fe.actionType.toUpperCase()) {
-            case "CLICK", "DOUBLE_CLICK" ->
-                    jd + "     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page click" + cap(fname) + "() {\n" +
-                            "        ui.click(" + constName + ");\n" +
-                            "        return this;\n    }\n";
-            case "FILL" ->
-                    jd + "     * @param value text to enter\n     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page enter" + cap(fname) + "(String value) {\n" +
-                            "        ui.fill(" + constName + ", value);\n" +
-                            "        return this;\n    }\n";
-            case "SELECT_OPTION" ->
-                    jd + "     * @param value option value to select\n     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page select" + cap(fname) + "(String value) {\n" +
-                            "        ui.selectOption(" + constName + ", value);\n" +
-                            "        return this;\n    }\n";
-            case "CHECK" ->
-                    jd + "     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page check" + cap(fname) + "() {\n" +
-                            "        ui.check(" + constName + "); return this;\n    }\n";
-            case "UNCHECK" ->
-                    jd + "     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page uncheck" + cap(fname) + "() {\n" +
-                            "        ui.uncheck(" + constName + "); return this;\n    }\n";
-            case "UPLOAD_FILE" ->
-                    jd + "     * @param filePath absolute path to file\n     * @return this page (fluent)\n     */\n" +
-                            "    public " + className + "Page uploadTo" + cap(fname) + "(String filePath) {\n" +
-                            "        ui.uploadFile(" + constName + ", java.nio.file.Paths.get(filePath));\n" +
-                            "        return this;\n    }\n";
-            default -> null;
-        };
-    }
-
-    private String buildGetterMethods(String fname, String actionType) {
-        if ("CLICK".equals(actionType)) return "";
-        String constName = toConstantName(fname);
-        return
-                "    /** @return inner text of '" + fname + "' */\n" +
-                        "    public String get" + cap(fname) + "Text()       { return ui.getText(" + constName + "); }\n\n" +
-                        "    /** @return true if '" + fname + "' is visible */\n" +
-                        "    public boolean is" + cap(fname) + "Visible()    { return ui.isVisible(" + constName + "); }\n\n" +
-                        "    /** @return true if '" + fname + "' is enabled */\n" +
-                        "    public boolean is" + cap(fname) + "Enabled()    { return ui.isEnabled(" + constName + "); }\n\n" +
-                        "    /** Wait until '" + fname + "' is visible. */\n" +
-                        "    public void waitFor" + cap(fname) + "Visible()   { ui.waitForVisible(" + constName + "); }\n\n";
-    }
-
-    private String buildCompositeMethod(IntentAnalyzer.Intent intent) {
-        String sig  = intent.toMethodSignature(className);
-        String name = intent.toMethodName();
-
-        // Build the method body by calling per-field methods
-        StringBuilder body = new StringBuilder();
-        for (ObjectNode ev : intent.sourceEvents) {
-            String at    = ev.path("actionType").asText();
-            String fname = toFieldName(ev);
-            if (fname == null) continue;
-            switch (at) {
-                case "FILL"          -> body.append("        enter").append(cap(fname)).append("(").append(toCamel(fname)).append("Value);\n");
-                case "CLICK"         -> body.append("        click").append(cap(fname)).append("();\n");
-                case "SELECT_OPTION" -> body.append("        select").append(cap(fname)).append("(").append(toCamel(fname)).append("Value);\n");
-            }
-        }
-
-        return
-                "    /**\n" +
-                        "     * " + intent.description + "\n" +
-                        "     * Intent: " + intent.type.name() + " — groups " + intent.sourceEvents.size() + " raw events.\n" +
-                        "     */\n" +
-                        "    " + sig + " {\n" +
-                        body +
-                        "        return this;\n    }\n\n";
-    }
-
-    private String buildStepImpl(IntentAnalyzer.Intent intent) {
-        String po   = toCamel(className) + "Page";
-        String meth = intent.toMethodName();
-
-        return switch (intent.type) {
-            case LOGIN ->
-                    "    @When(\"user logs in with {string} and {string}\")\n" +
-                            "    @Step(\"Login with user '{0}'\")\n" +
-                            "    public void userLogsIn(String username, String password) {\n" +
-                            "        " + po + ".login(username, password);\n    }\n";
-            case SEARCH ->
-                    "    @When(\"user searches for {string}\")\n" +
-                            "    @Step(\"Search for '{0}'\")\n" +
-                            "    public void userSearchesFor(String query) {\n" +
-                            "        " + po + ".search(query);\n    }\n";
-            case TRANSFER ->
-                    "    @When(\"user transfers {string}\")\n" +
-                            "    @Step(\"Transfer amount '{0}'\")\n" +
-                            "    public void userTransfers(String amount) {\n" +
-                            "        " + po + ".transfer(amount);\n    }\n";
-            case FORM_SUBMIT -> {
-                String params = intent.params.entrySet().stream()
-                        .filter(e -> !e.getKey().equals("formName"))
-                        .map(e -> "String " + toCamel(e.getKey()))
-                        .reduce((a, b) -> a + ", " + b).orElse("");
-                String args = intent.params.entrySet().stream()
-                        .filter(e -> !e.getKey().equals("formName"))
-                        .map(e -> toCamel(e.getKey()))
-                        .reduce((a, b) -> a + ", " + b).orElse("");
-                String formName = intent.params.getOrDefault("formName","form");
-                yield "    @When(\"user submits the {string} form\")\n" +
-                        "    @Step(\"Submit form'{0}'\")\n" +
-                        "    public void userSubmitsForm(String formName) {\n" +
-                        "        " + po + "." + meth + "(" + args + ");\n    }\n";
-            }
-            case NAVIGATION ->
-                    "    @When(\"user navigates to {string}\")\n" +
-                            "    @Step(\"Navigate to '{0}'\")\n" +
-                            "    public void userNavigatesTo(String url) {\n" +
-                            "        " + po + ".navigateTo(url);\n    }\n";
-            case SELECT_FLOW ->
-                    "    @When(\"user selects {string} from {string}\")\n" +
-                            "    @Step(\"Select '{0}' from '{1}'\")\n" +
-                            "    public void userSelects(String value, String field) {\n" +
-                            "        " + po + "." + meth + "(value);\n    }\n";
-            case UPLOAD_FLOW ->
-                    "    @When(\"user uploads file {string}\")\n" +
-                            "    @Step(\"Upload file '{0}'\")\n" +
-                            "    public void userUploadsFile(String file) {\n" +
-                            "        " + po + ".uploadFile(file);\n    }\n";
-            case RAW_ACTION -> buildRawStepImpl(intent, po);
-        };
-    }
-
-    private String buildRawStepImpl(IntentAnalyzer.Intent intent, String po) {
-        if (intent.sourceEvents.isEmpty()) return null;
-        ObjectNode ev = intent.sourceEvents.get(0);
-        String at  = ev.path("actionType").asText();
-        String loc = readableLabel(ev);
-        String fname = toFieldName(ev);
-        if (fname == null) return null;
-
-        return switch (at) {
-            case "CLICK" ->
-                    "    @When(\"user clicks the {string} element\")\n" +
-                            "    @Step(\"Click: {0}\")\n" +
-                            "    public void userClicksThe" + cap(toCamel(loc)) + "(String element) {\n" +
-                            "        " + po + ".click" + cap(fname) + "();\n    }\n";
-            case "FILL" ->
-                    "    @When(\"user enters {string} in the {string} field\")\n" +
-                            "    @Step(\"Fill '{0}' into: {1}\")\n" +
-                            "    public void userEntersInThe" + cap(toCamel(loc)) + "(String value, String field) {\n" +
-                            "        " + po + ".enter" + cap(fname) + "(value);\n    }\n";
-            case "PRESS_KEY" ->
-                    "    @When(\"user presses the {string} key\")\n" +
-                            "    @Step(\"Press key: {0}\")\n" +
-                            "    public void userPressesTheKey(String key) { page.keyboard().press(key); }\n";
-            default -> null;
-        };
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  LOCATOR HELPERS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private String scopedPwExpr(JsonNode loc) {
-        String strategy  = loc.path("strategy").asText("css");
-        int    nthIndex  = loc.path("nthIndex").asInt(0);
-        int    matchCount= loc.path("matchCount").asInt(1);
-        String pwExpr    = loc.path("playwrightLocator").asText("");
-
-        if (pwExpr.isBlank()) {
-            pwExpr = switch (strategy) {
-                case "href"        -> "page.locator(\"a[href=\\\"" + esc(loc.path("href").asText()) + "\\\"]\")";
-                case "css-id"      -> "page.locator(\"" + loc.path("cssSelector").asText() + "\")";
-                case "testId"      -> "page.getByTestId(\"" + esc(loc.path("testId").asText()) + "\")";
-                case "role"        -> "page.getByRole(AriaRole." +
-                        loc.path("ariaRole").asText("BUTTON").toUpperCase().replace("-","_") +
-                        ", new Page.GetByRoleOptions().setName(\"" + esc(loc.path("ariaLabel").asText()) + "\"))";
-                case "placeholder" -> "page.getByPlaceholder(\"" + esc(loc.path("placeholder").asText()) + "\")";
-                default            -> "page.locator(\"" + esc(loc.path("cssSelector").asText("body")) + "\")";
-            };
-        }
-        boolean needsNth = matchCount > 1 && nthIndex > 0
-                && !List.of("href","css-id","testId","xpath").contains(strategy);
-        return needsNth ? pwExpr + ".nth(" + nthIndex + ")" : pwExpr;
-    }
-
-    private String toFieldName(JsonNode e) {
-        if (e == null) return null;
-        JsonNode loc = e.path("locator");
-        if (loc.isMissingNode() || loc.isNull()) return null;
-        String strategy = loc.path("strategy").asText("");
-        String base = switch (strategy) {
-            case "href"        -> loc.path("href").asText("").replaceAll(".*/(.*)", "$1").replace("-"," ");
-            case "css-id"      -> loc.path("id").asText("");
-            case "testId"      -> loc.path("testId").asText("");
-            case "role"        -> loc.path("ariaLabel").asText(loc.path("text").asText(""));
-            case "placeholder" -> loc.path("placeholder").asText("");
-            default            -> loc.path("text").asText(loc.path("cssSelector").asText("element"));
-        };
-        if (base.isBlank()) base = "element";
-        String at = e.path("actionType").asText("");
-        String suffix = switch (at) {
-            case "CLICK","DOUBLE_CLICK" -> {
-                String tag = e.path("elementSnapshot").path("tagName").asText("");
-                yield "button".equals(tag) ? "Button" : "a".equals(tag) ? "Link" : "Element";
-            }
-            case "FILL"          -> "Field";
-            case "SELECT_OPTION" -> "Dropdown";
-            case "CHECK","UNCHECK" -> "Checkbox";
-            case "UPLOAD_FILE"   -> "Upload";
-            default -> "Element";
-        };
-        String cleaned = base.replaceAll("[^a-zA-Z0-9 ]"," ").trim();
-        if (cleaned.isBlank()) return null;
-        return toCamel(cleaned) + suffix;
-    }
-
-    private String readableLabel(JsonNode e) {
-        JsonNode loc = e.path("locator");
-        if (loc.isMissingNode() || loc.isNull()) return "element";
-        for (String f : new String[]{"ariaLabel","placeholder","text","id","href","testId"}) {
-            String v = loc.path(f).asText("");
-            if (!v.isBlank()) return v.substring(0, Math.min(v.length(), 50));
-        }
-        return loc.path("cssSelector").asText("element");
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  STRING UTILITIES
-    // ═════════════════════════════════════════════════════════════════════════
     private static String toPascal(String s) {
-        if (s == null || s.isBlank()) return "Recorded";
-        String[] p = s.replaceAll("[^a-zA-Z0-9 ]"," ").trim().split("\\s+");
+        if (s == null || s.isBlank()) return "Generated";
+        String[] parts = s.replaceAll("[^a-zA-Z0-9 ]", " ").trim().split("\\s+");
         StringBuilder sb = new StringBuilder();
-        for (String w : p) if (!w.isBlank())
-            sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1).toLowerCase());
-        return sb.toString();
+        for (String w : parts) {
+            if (!w.isBlank())
+                sb.append(Character.toUpperCase(w.charAt(0)))
+                        .append(w.substring(1).toLowerCase());
+        }
+        return sb.isEmpty() ? "Generated" : sb.toString();
     }
+
     private static String toCamel(String s) {
-        String p = toPascal(s);
-        return p.isEmpty() ? "element" : Character.toLowerCase(p.charAt(0)) + p.substring(1);
+        if (s == null || s.isBlank()) return "value";
+        String[] parts = s.trim().split("[\\s_\\-]+");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            String w = parts[i].replaceAll("[^a-zA-Z0-9]", "");
+            if (w.isBlank()) continue;
+            sb.append(i == 0
+                    ? Character.toLowerCase(w.charAt(0)) + w.substring(1).toLowerCase()
+                    : Character.toUpperCase(w.charAt(0)) + w.substring(1).toLowerCase());
+        }
+        return sb.isEmpty() ? "value" : sb.toString();
     }
-    private static String cap(String s) {
-        return s == null || s.isBlank() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+
+    private static String toConstant(String s) {
+        if (s == null || s.isBlank()) return "ELEMENT_LOCATOR";
+        return s.replaceAll("[^a-zA-Z0-9]", "_")
+                .replaceAll("_+", "_")
+                .replaceAll("^_|_$", "")
+                .toUpperCase();
     }
-    private static String esc(String s) {
-        return s == null ? "" : s.replace("\\","\\\\").replace("\"","\\\"");
-    }
+
     private static String toSentence(String s) {
-        if (s == null || s.isBlank()) return "complete the action";
-        return Character.toLowerCase(s.charAt(0)) + s.substring(1).toLowerCase();
+        if (s == null || s.isBlank()) return "perform the workflow";
+        return s.toLowerCase().replaceAll("[^a-z0-9 ]", " ").trim();
+    }
+
+    private static String locatorLabel(ObjectNode event) {
+        JsonNode loc = event.path("locator");
+        String v;
+        v = loc.path("ariaLabel").asText("").trim();   if (!v.isBlank()) return v;
+        v = loc.path("text").asText("").trim();        if (!v.isBlank()) return v;
+        v = loc.path("id").asText("").trim();          if (!v.isBlank()) return v;
+        return "Element";
+    }
+
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }
